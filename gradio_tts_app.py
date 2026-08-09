@@ -1,17 +1,29 @@
-import random
+import json
 import os
+from pathlib import Path
+import random
+import re
+import shutil
+import subprocess
+import time
+import traceback
+from uuid import uuid4
 
+import gradio as gr
 import numpy as np
 import torch
-import gradio as gr
 import torchaudio as ta
 
+from chatterbox_vllm.epub import EpubError, TextChunk, chunk_book, load_epub
 from chatterbox_vllm.tts import ChatterboxTTS
 
+
 DEVICE = "cuda"
+OUTPUT_ROOT = Path(__file__).resolve().parent / "audiobook_outputs"
 
 config_seed = None
 global_model = None
+
 
 def set_seed(seed: int):
     torch.manual_seed(seed)
@@ -23,93 +35,348 @@ def set_seed(seed: int):
     config_seed = seed
 
 
+def selected_seed(seed_num) -> int | None:
+    seed = int(seed_num or 0)
+    if seed == 0:
+        return None
+    set_seed(seed)
+    return seed
+
+
 def load_model():
     print("Loading model...")
     global global_model
     global_model = ChatterboxTTS.from_pretrained(
-        gpu_memory_utilization = 0.6,
-        max_model_len = 1000,
+        gpu_memory_utilization=0.6,
+        max_model_len=1000,
 
         # Disable CUDA graphs - it's causing tensors to get corrupted right now.
-        enforce_eager = True,
+        enforce_eager=True,
     )
     return global_model
 
-def generate(text, audio_prompt_path, exaggeration, temperature, seed_num,
-             #cfgw,
-             diffusion_steps,
-             min_p, top_p, repetition_penalty):
-    if seed_num != 0:
-        set_seed(int(seed_num))
 
+def generation_arguments(exaggeration, temperature, diffusion_steps, min_p,
+                         top_p, repetition_penalty, seed):
+    return {
+        "exaggeration": float(exaggeration),
+        "temperature": float(temperature),
+        "diffusion_steps": int(diffusion_steps),
+        "min_p": float(min_p),
+        "top_p": float(top_p),
+        "repetition_penalty": float(repetition_penalty),
+        "seed": seed,
+    }
+
+
+def generate_sample(text, audio_prompt_path, exaggeration, temperature, seed_num,
+                    diffusion_steps, min_p, top_p, repetition_penalty):
+    if not text or not text.strip():
+        raise gr.Error("Enter some text to synthesize.")
+
+    seed = selected_seed(seed_num)
+    args = generation_arguments(
+        exaggeration, temperature, diffusion_steps, min_p, top_p,
+        repetition_penalty, seed,
+    )
     print(f"Using text: {text}")
     print(f"Using audio_prompt_path: {audio_prompt_path}")
-    print(f"Using seed: {config_seed}")
-    print(f"Using temperature: {temperature}")
-    print(f"Using exaggeration: {exaggeration}")
-    print(f"Using min_p: {min_p}")
-    print(f"Using top_p: {top_p}")
-    print(f"Using repetition_penalty: {repetition_penalty}")
+    print(f"Using settings: {args}")
 
     wav = global_model.generate(
-        [text],
+        [text.strip()],
         audio_prompt_path=audio_prompt_path,
-        exaggeration=exaggeration,
-        temperature=temperature,
-        # cfg_weight=cfgw,
-        diffusion_steps=diffusion_steps,
-        min_p=min_p,
-        top_p=top_p,
-        repetition_penalty=repetition_penalty,
-        seed=config_seed,
+        **args,
     )
     return (global_model.sr, wav[0].squeeze(0).numpy())
 
 
-with gr.Blocks() as demo:
-    with gr.Row():
-        with gr.Column():
-            text = gr.Textbox(
-                value="Now let's make my mum's favourite. So three mars bars into the pan. Then we add the tuna and just stir for a bit, just let the chocolate and fish infuse. A sprinkle of olive oil and some tomato ketchup. Now smell that. Oh boy this is going to be incredible.",
-                label="Text to synthesize (max chars 300)",
-                max_lines=5
-            )
-            ref_wav = gr.Audio(sources=["upload", "microphone"], type="filepath", label="Reference Audio File", value=None)
-            exaggeration = gr.Slider(0.25, 2, step=.05, label="Exaggeration (Neutral = 0.5, extreme values can be unstable)", value=.5)
-            # cfg_weight = gr.Slider(0.0, 1, step=.05, label="CFG/Pace", value=0.5)
+def inspect_epub_file(epub_path, max_chars):
+    if not epub_path:
+        return "Upload a DRM-free EPUB to inspect its chapters before generation."
+    try:
+        book = load_epub(epub_path)
+        chunks = chunk_book(book, max_chars=int(max_chars))
+        characters = sum(len(chapter.text) for chapter in book.chapters)
+        return (
+            f"**{book.title}** — {len(book.chapters)} readable spine documents, "
+            f"{characters:,} characters, and **{len(chunks):,} speech chunks** at "
+            f"the current {int(max_chars)}-character limit."
+        )
+    except EpubError as error:
+        return f"❌ {error}"
 
+
+def _safe_project_name(title: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", title).strip("-._")
+    return (slug[:80] or "audiobook") + "-" + time.strftime("%Y%m%d-%H%M%S") + "-" + uuid4().hex[:6]
+
+
+def _waveform_for_save(waveform, text: str, sample_rate: int) -> torch.Tensor:
+    if hasattr(waveform, "detach"):
+        waveform = waveform.detach()
+    tensor = torch.as_tensor(waveform).to(dtype=torch.float32, device="cpu")
+    if tensor.ndim == 1:
+        tensor = tensor.unsqueeze(0)
+    elif tensor.ndim == 2 and tensor.shape[1] == 1:
+        tensor = tensor.transpose(0, 1)
+    if tensor.ndim != 2 or tensor.shape[0] != 1 or tensor.shape[1] == 0:
+        raise ValueError("The model returned an empty or non-mono waveform")
+    if not torch.isfinite(tensor).all():
+        raise ValueError("The model returned NaN or infinite audio")
+
+    duration = tensor.shape[1] / sample_rate
+    words = max(1, len(text.split()))
+    if duration < min(0.25, 0.04 * words):
+        raise ValueError(f"Generated audio is truncated ({duration:.2f}s for {words} words)")
+    if duration > 15.0 + 5.0 * words:
+        raise ValueError(f"Generated audio is implausibly long ({duration:.1f}s for {words} words)")
+    return tensor
+
+
+def _write_metadata(path: Path, title: str, source_path: str, chunks: list[TextChunk],
+                    settings: dict, completed: int, output_path: str | None = None):
+    data = {
+        "title": title,
+        "source_epub": Path(source_path).name,
+        "settings": settings,
+        "completed_chunks": completed,
+        "total_chunks": len(chunks),
+        "output_file": output_path,
+        "chunks": [
+            {
+                "index": index,
+                "chapter_index": chunk.chapter_index,
+                "chapter_title": chunk.chapter_title,
+                "text": chunk.text,
+                "audio_file": f"chunks/{index:06d}.wav" if index < completed else None,
+            }
+            for index, chunk in enumerate(chunks)
+        ],
+    }
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def _write_silence(path: Path, sample_rate: int, duration: float):
+    samples = torch.zeros((1, max(1, int(sample_rate * duration))), dtype=torch.float32)
+    ta.save(str(path), samples, sample_rate, encoding="PCM_S", bits_per_sample=16)
+
+
+def _assemble_audiobook(project_dir: Path, chunks: list[TextChunk], sample_rate: int) -> Path:
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("FFmpeg is required to assemble the audiobook MP3")
+
+    short_pause = project_dir / "pause-between-chunks.wav"
+    chapter_pause = project_dir / "pause-between-chapters.wav"
+    _write_silence(short_pause, sample_rate, 0.18)
+    _write_silence(chapter_pause, sample_rate, 0.9)
+
+    concat_path = project_dir / "concat.txt"
+    entries: list[Path] = []
+    for index, chunk in enumerate(chunks):
+        if index:
+            previous = chunks[index - 1]
+            entries.append(chapter_pause if chunk.chapter_index != previous.chapter_index else short_pause)
+        entries.append(project_dir / "chunks" / f"{index:06d}.wav")
+    concat_path.write_text(
+        "".join(f"file '{entry.as_posix()}'\n" for entry in entries),
+        encoding="utf-8",
+    )
+
+    output_path = project_dir / "audiobook.mp3"
+    result = subprocess.run(
+        [
+            ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "concat", "-safe", "0", "-i", str(concat_path),
+            "-codec:a", "libmp3lame", "-q:a", "2", str(output_path),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"FFmpeg failed to assemble the audiobook: {result.stderr.strip()}")
+    return output_path
+
+
+def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperature,
+                            seed_num, diffusion_steps, min_p, top_p,
+                            repetition_penalty, max_chars, batch_size,
+                            progress=gr.Progress()):
+    if not epub_path:
+        return None, "❌ Upload an EPUB first."
+    if not audio_prompt_path:
+        return None, "❌ Upload or record reference audio first."
+
+    project_dir = None
+    try:
+        book = load_epub(epub_path)
+        chunks = chunk_book(book, max_chars=int(max_chars))
+        if not chunks:
+            raise EpubError("EPUB did not produce any speech chunks")
+
+        seed = selected_seed(seed_num)
+        settings = generation_arguments(
+            exaggeration, temperature, diffusion_steps, min_p, top_p,
+            repetition_penalty, seed,
+        )
+        settings.update({"max_chars": int(max_chars), "batch_size": int(batch_size)})
+
+        OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+        project_dir = OUTPUT_ROOT / _safe_project_name(book.title)
+        chunks_dir = project_dir / "chunks"
+        chunks_dir.mkdir(parents=True)
+        metadata_path = project_dir / "metadata.json"
+        _write_metadata(metadata_path, book.title, epub_path, chunks, settings, 0)
+
+        progress(0, desc=f"Preparing voice for {len(chunks):,} chunks")
+        s3gen_ref, cond_emb = global_model.get_audio_conditionals(audio_prompt_path)
+        batch_size = int(batch_size)
+        for start in range(0, len(chunks), batch_size):
+            batch = chunks[start:start + batch_size]
+            progress(start / len(chunks), desc=f"Generating chunks {start + 1}–{start + len(batch)} of {len(chunks)}")
+            batch_args = dict(settings)
+            batch_args.pop("max_chars")
+            batch_args.pop("batch_size")
+            if seed is not None:
+                batch_args["seed"] = seed + start
+            audios = global_model.generate_with_conds(
+                [chunk.text for chunk in batch],
+                s3gen_ref=s3gen_ref,
+                cond_emb=cond_emb,
+                **batch_args,
+            )
+            if len(audios) != len(batch):
+                raise RuntimeError(f"Model returned {len(audios)} outputs for a batch of {len(batch)}")
+            for offset, (chunk, audio) in enumerate(zip(batch, audios)):
+                chunk_index = start + offset
+                waveform = _waveform_for_save(audio, chunk.text, global_model.sr)
+                ta.save(
+                    str(chunks_dir / f"{chunk_index:06d}.wav"),
+                    waveform,
+                    global_model.sr,
+                    encoding="PCM_S",
+                    bits_per_sample=16,
+                )
+            _write_metadata(metadata_path, book.title, epub_path, chunks, settings, start + len(batch))
+
+        progress(0.98, desc="Assembling final MP3")
+        output_path = _assemble_audiobook(project_dir, chunks, global_model.sr)
+        relative_output = output_path.relative_to(Path(__file__).resolve().parent).as_posix()
+        _write_metadata(metadata_path, book.title, epub_path, chunks, settings, len(chunks), relative_output)
+        progress(1, desc="Audiobook complete")
+        return str(output_path), (
+            f"✅ **{book.title}** complete: {len(book.chapters)} chapters and "
+            f"{len(chunks):,} speech chunks. Files were saved under `{project_dir}`."
+        )
+    except Exception as error:
+        traceback.print_exc()
+        location = f" Partial files remain in `{project_dir}`." if project_dir else ""
+        return None, f"❌ {error}.{location}"
+
+
+with gr.Blocks(title="Chatterbox vLLM Audiobook") as demo:
+    gr.Markdown("# Chatterbox vLLM\nQuick voice tests and batched EPUB audiobook generation.")
+
+    with gr.Row():
+        with gr.Column(scale=1):
+            gr.Markdown("### Voice and generation settings")
+            ref_wav = gr.Audio(
+                sources=["upload", "microphone"],
+                type="filepath",
+                label="Reference Audio File",
+                value=None,
+            )
+            exaggeration = gr.Slider(
+                0.25, 2, step=.05,
+                label="Exaggeration (Neutral = 0.5; extreme values can be unstable)",
+                value=.5,
+            )
             with gr.Accordion("More options", open=False):
                 seed_num = gr.Number(value=0, label="Random seed (0 for random)")
-                diffusion_steps = gr.Slider(1, 15, step=1, label="Diffusion Steps (more = slower and higher quality)", value=10)
-                temp = gr.Slider(0.05, 5, step=.05, label="temperature", value=.8)
-                min_p = gr.Slider(0.00, 1.00, step=0.01, label="min_p || Newer Sampler. Recommend 0.02 > 0.1. Handles Higher Temperatures better. 0.00 Disables", value=0.05)
-                top_p = gr.Slider(0.00, 1.00, step=0.01, label="top_p || Original Sampler. 1.0 Disables(recommended). Original 0.8", value=1.00)
-                repetition_penalty = gr.Slider(1.00, 2.00, step=0.1, label="repetition_penalty", value=1.2)
+                diffusion_steps = gr.Slider(
+                    1, 15, step=1,
+                    label="Diffusion Steps (more = slower and higher quality)",
+                    value=10,
+                )
+                temp = gr.Slider(0.05, 5, step=.05, label="Temperature", value=.8)
+                min_p = gr.Slider(
+                    0.00, 1.00, step=0.01,
+                    label="Min-P (0 disables)",
+                    value=0.05,
+                )
+                top_p = gr.Slider(
+                    0.00, 1.00, step=0.01,
+                    label="Top-P (1.0 disables)",
+                    value=1.00,
+                )
+                repetition_penalty = gr.Slider(
+                    1.00, 2.00, step=0.1,
+                    label="Repetition Penalty",
+                    value=1.2,
+                )
 
-            run_btn = gr.Button("Generate", variant="primary")
+        with gr.Column(scale=2):
+            with gr.Tab("Text Sample"):
+                text = gr.Textbox(
+                    value="Now let's make my mum's favourite. So three mars bars into the pan. Then we add the tuna and just stir for a bit, just let the chocolate and fish infuse.",
+                    label="Text to synthesize",
+                    max_lines=6,
+                )
+                run_btn = gr.Button("Generate Sample", variant="primary")
+                audio_output = gr.Audio(label="Output Audio")
 
-        with gr.Column():
-            audio_output = gr.Audio(label="Output Audio")
+            with gr.Tab("EPUB Audiobook"):
+                epub_file = gr.File(
+                    label="DRM-free EPUB",
+                    file_types=[".epub"],
+                    type="filepath",
+                )
+                with gr.Row():
+                    max_chars = gr.Slider(
+                        120, 300, step=10, value=280,
+                        label="Maximum characters per speech chunk",
+                    )
+                    batch_size = gr.Slider(
+                        1, 32, step=1, value=8,
+                        label="vLLM batch size",
+                    )
+                epub_status = gr.Markdown(
+                    "Upload a DRM-free EPUB to inspect its chapters before generation."
+                )
+                epub_btn = gr.Button("Generate EPUB Audiobook", variant="primary")
+                epub_audio_output = gr.Audio(label="Completed Audiobook")
 
     run_btn.click(
-        fn=generate,
+        fn=generate_sample,
         inputs=[
-            text,
-            ref_wav,
-            exaggeration,
-            temp,
-            seed_num,
-            #cfg_weight,
-            diffusion_steps,
-            min_p,
-            top_p,
-            repetition_penalty,
+            text, ref_wav, exaggeration, temp, seed_num, diffusion_steps,
+            min_p, top_p, repetition_penalty,
         ],
         outputs=audio_output,
     )
+    epub_file.change(
+        fn=inspect_epub_file,
+        inputs=[epub_file, max_chars],
+        outputs=epub_status,
+    )
+    max_chars.release(
+        fn=inspect_epub_file,
+        inputs=[epub_file, max_chars],
+        outputs=epub_status,
+    )
+    epub_btn.click(
+        fn=generate_epub_audiobook,
+        inputs=[
+            epub_file, ref_wav, exaggeration, temp, seed_num, diffusion_steps,
+            min_p, top_p, repetition_penalty, max_chars, batch_size,
+        ],
+        outputs=[epub_audio_output, epub_status],
+    )
+
 
 if __name__ == "__main__":
-    # Don't let Gradio manage the model loading, it's causing issues.
+    # Don't let Gradio manage model loading; it causes issues with vLLM workers.
     os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
     load_model()
 
