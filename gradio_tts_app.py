@@ -22,6 +22,7 @@ from chatterbox_vllm.audio import (
     TRUE_PEAK_DBTP,
     normalize_speech_wav,
 )
+from chatterbox_vllm.background import BackgroundTaskPool
 from chatterbox_vllm.epub import EpubBook, EpubError, TextChunk, chunk_book, load_epub
 from chatterbox_vllm.m4b import ChapterMarker, build_ffmetadata
 from chatterbox_vllm.progress import GenerationControl, estimate_progress, format_duration
@@ -30,6 +31,8 @@ from chatterbox_vllm.tts import ChatterboxTTS
 
 DEVICE = "cuda"
 OUTPUT_ROOT = Path(__file__).resolve().parent / "audiobook_outputs"
+AUDIO_WORKERS = min(4, os.cpu_count() or 1)
+MAX_PENDING_AUDIO_TASKS = AUDIO_WORKERS * 16
 
 config_seed = None
 global_model = None
@@ -177,6 +180,22 @@ def _waveform_for_save(waveform, text: str, sample_rate: int) -> torch.Tensor:
     return tensor
 
 
+def _save_and_normalize_chunk(
+    path: Path,
+    waveform: torch.Tensor,
+    sample_rate: int,
+    ffmpeg: str,
+) -> Path:
+    ta.save(
+        str(path),
+        waveform,
+        sample_rate,
+        encoding="PCM_S",
+        bits_per_sample=16,
+    )
+    return normalize_speech_wav(path, sample_rate, ffmpeg=ffmpeg)
+
+
 def _write_metadata(path: Path, book: EpubBook, source_path: str, chunks: list[TextChunk],
                     settings: dict, completed: int, output_path: str | None = None):
     data = {
@@ -321,6 +340,7 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperat
     project_dir = None
     chunks = []
     completed_chunks = 0
+    audio_tasks = None
     generation_control.begin()
     try:
         book = load_epub(epub_path)
@@ -351,6 +371,10 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperat
         project_dir = OUTPUT_ROOT / _safe_project_name(book.title)
         chunks_dir = project_dir / "chunks"
         chunks_dir.mkdir(parents=True)
+        audio_tasks = BackgroundTaskPool(
+            max_workers=AUDIO_WORKERS,
+            max_pending=MAX_PENDING_AUDIO_TASKS,
+        )
         metadata_path = project_dir / "metadata.json"
         _write_metadata(metadata_path, book, epub_path, chunks, settings, 0)
 
@@ -393,6 +417,7 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperat
                 cond_emb=cond_emb,
                 **batch_args,
             )
+            audio_tasks.check()
             if len(audios) != len(batch):
                 raise RuntimeError(f"Model returned {len(audios)} outputs for a batch of {len(batch)}")
             for offset, (chunk, audio) in enumerate(zip(batch, audios)):
@@ -401,17 +426,12 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperat
                 generated_audio_seconds += waveform.shape[1] / global_model.sr
                 completed_characters += len(chunk.text)
                 chunk_path = chunks_dir / f"{chunk_index:06d}.wav"
-                ta.save(
-                    str(chunk_path),
+                audio_tasks.submit(
+                    _save_and_normalize_chunk,
+                    chunk_path,
                     waveform,
                     global_model.sr,
-                    encoding="PCM_S",
-                    bits_per_sample=16,
-                )
-                normalize_speech_wav(
-                    chunk_path,
-                    global_model.sr,
-                    ffmpeg=ffmpeg,
+                    ffmpeg,
                 )
             completed_chunks = start + len(batch)
             _write_metadata(
@@ -436,6 +456,9 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperat
             if generation_control.stop_requested():
                 raise GenerationStopped
 
+        progress(0.975, desc="Finishing background audio processing")
+        audio_tasks.finish()
+        audio_tasks = None
         progress(0.98, desc="Assembling chaptered M4B")
         output_path = _assemble_audiobook(project_dir, book, chunks, global_model.sr)
         relative_output = output_path.relative_to(Path(__file__).resolve().parent).as_posix()
@@ -451,6 +474,9 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperat
             f"Files were saved under `{project_dir}`."
         )
     except GenerationStopped:
+        if audio_tasks is not None:
+            audio_tasks.cancel_and_wait()
+            audio_tasks = None
         print(f"EPUB generation stopped after {completed_chunks} of {len(chunks)} chunks")
         try:
             _delete_stopped_project(project_dir)
@@ -466,10 +492,15 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperat
                 f"deleted: {cleanup_error}"
             )
     except Exception as error:
+        if audio_tasks is not None:
+            audio_tasks.cancel_and_wait()
+            audio_tasks = None
         traceback.print_exc()
         location = f" Partial files remain in `{project_dir}`." if project_dir else ""
         return None, f"❌ {error}.{location}"
     finally:
+        if audio_tasks is not None:
+            audio_tasks.cancel_and_wait()
         generation_control.finish()
 
 
