@@ -5,6 +5,7 @@ import random
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 import traceback
 from uuid import uuid4
@@ -102,7 +103,19 @@ def generate_sample(text, audio_prompt_path, exaggeration, temperature, seed_num
         audio_prompt_path=audio_prompt_path,
         **args,
     )
-    return (global_model.sr, wav[0].squeeze(0).numpy())
+    waveform = _waveform_for_save(wav[0], text.strip(), global_model.sr)
+    with tempfile.TemporaryDirectory(prefix="chatterbox-preview-") as directory:
+        output_path = Path(directory) / "preview.wav"
+        ta.save(
+            str(output_path),
+            waveform,
+            global_model.sr,
+            encoding="PCM_S",
+            bits_per_sample=16,
+        )
+        normalize_speech_wav(output_path, global_model.sr)
+        normalized, sample_rate = ta.load(str(output_path))
+    return (sample_rate, normalized.squeeze(0).numpy())
 
 
 def inspect_epub_file(epub_path, max_chars):
