@@ -117,4 +117,4 @@ if __name__ == "__main__":
     demo.queue(
         max_size=50,
         default_concurrency_limit=1,
-    ).launch(share=True)
+    ).launch(server_name="0.0.0.0", server_port=7860, share=False)
