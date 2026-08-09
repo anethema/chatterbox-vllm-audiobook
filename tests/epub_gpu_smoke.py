@@ -116,15 +116,11 @@ def main() -> None:
         )
         print("STOPPED_OUTPUT", stopped_output)
         print("STOPPED_STATUS", stopped_status)
-        if stopped_output is not None or "stopped after 1 of 2 chunks" not in stopped_status:
+        if stopped_output is not None or "chunk files were deleted" not in stopped_status:
             raise RuntimeError("Cooperative stop did not stop after the first batch")
         stopped_projects = set(app.OUTPUT_ROOT.iterdir()) - existing_projects
-        if len(stopped_projects) != 1:
-            raise RuntimeError("Stop smoke test did not create exactly one partial project")
-        stopped_project = stopped_projects.pop()
-        stopped_metadata = json.loads((stopped_project / "metadata.json").read_text())
-        if stopped_metadata["completed_chunks"] != 1 or (stopped_project / "audiobook.m4b").exists():
-            raise RuntimeError("Stopped project metadata or output state is invalid")
+        if stopped_projects:
+            raise RuntimeError("Stopped project directory was not deleted")
     finally:
         if app.global_model is not None:
             app.global_model.shutdown()

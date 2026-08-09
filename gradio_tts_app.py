@@ -126,6 +126,16 @@ def _safe_project_name(title: str) -> str:
     return (slug[:80] or "audiobook") + "-" + time.strftime("%Y%m%d-%H%M%S") + "-" + uuid4().hex[:6]
 
 
+def _delete_stopped_project(project_dir: Path) -> None:
+    """Delete only a generated project that is directly below OUTPUT_ROOT."""
+
+    output_root = OUTPUT_ROOT.resolve()
+    target = project_dir.resolve()
+    if target == output_root or target.parent != output_root:
+        raise RuntimeError(f"Refusing to delete unexpected project path: {target}")
+    shutil.rmtree(target)
+
+
 def _waveform_for_save(waveform, text: str, sample_rate: int) -> torch.Tensor:
     if hasattr(waveform, "detach"):
         waveform = waveform.detach()
@@ -399,10 +409,19 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperat
         )
     except GenerationStopped:
         print(f"EPUB generation stopped after {completed_chunks} of {len(chunks)} chunks")
-        return None, (
-            f"⏹️ Generation stopped after {completed_chunks:,} of {len(chunks):,} chunks. "
-            f"Completed chunk files remain in `{project_dir}`; no final M4B was assembled."
-        )
+        try:
+            _delete_stopped_project(project_dir)
+            return None, (
+                f"⏹️ Generation stopped after {completed_chunks:,} of "
+                f"{len(chunks):,} chunks. The incomplete project and its chunk "
+                "files were deleted."
+            )
+        except Exception as cleanup_error:
+            traceback.print_exc()
+            return None, (
+                f"⚠️ Generation stopped, but the incomplete project could not be "
+                f"deleted: {cleanup_error}"
+            )
     except Exception as error:
         traceback.print_exc()
         location = f" Partial files remain in `{project_dir}`." if project_dir else ""
