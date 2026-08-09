@@ -515,15 +515,6 @@ with gr.Blocks(title="Chatterbox vLLM Audiobook") as demo:
                 )
 
         with gr.Column(scale=2):
-            with gr.Tab("Text Sample"):
-                text = gr.Textbox(
-                    value="Now let's make my mum's favourite. So three mars bars into the pan. Then we add the tuna and just stir for a bit, just let the chocolate and fish infuse.",
-                    label="Text to synthesize",
-                    max_lines=6,
-                )
-                run_btn = gr.Button("Generate Sample", variant="primary")
-                audio_output = gr.Audio(label="Output Audio")
-
             with gr.Tab("EPUB Audiobook"):
                 epub_file = gr.File(
                     label="DRM-free EPUB",
@@ -548,6 +539,15 @@ with gr.Blocks(title="Chatterbox vLLM Audiobook") as demo:
                 epub_status = gr.Markdown("")
                 epub_result_status = gr.State("")
                 epub_audio_output = gr.Audio(label="Completed Audiobook (M4B)")
+
+            with gr.Tab("Text Sample"):
+                text = gr.Textbox(
+                    value="Now let's make my mum's favourite. So three mars bars into the pan. Then we add the tuna and just stir for a bit, just let the chocolate and fish infuse.",
+                    label="Text to synthesize",
+                    max_lines=6,
+                )
+                run_btn = gr.Button("Generate Sample", variant="primary")
+                audio_output = gr.Audio(label="Output Audio")
 
     run_btn.click(
         fn=generate_sample,
