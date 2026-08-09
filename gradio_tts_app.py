@@ -15,6 +15,12 @@ import numpy as np
 import torch
 import torchaudio as ta
 
+from chatterbox_vllm.audio import (
+    LOUDNESS_RANGE_LU,
+    TARGET_LUFS,
+    TRUE_PEAK_DBTP,
+    normalize_speech_wav,
+)
 from chatterbox_vllm.epub import EpubBook, EpubError, TextChunk, chunk_book, load_epub
 from chatterbox_vllm.m4b import ChapterMarker, build_ffmetadata
 from chatterbox_vllm.progress import GenerationControl, estimate_progress, format_duration
@@ -314,7 +320,19 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperat
             exaggeration, temperature, diffusion_steps, min_p, top_p,
             repetition_penalty, seed,
         )
-        settings.update({"max_chars": int(max_chars), "batch_size": int(batch_size)})
+        settings.update(
+            {
+                "max_chars": int(max_chars),
+                "batch_size": int(batch_size),
+                "loudness_target_lufs": TARGET_LUFS,
+                "true_peak_dbtp": TRUE_PEAK_DBTP,
+                "loudness_range_lu": LOUDNESS_RANGE_LU,
+            }
+        )
+
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            raise RuntimeError("FFmpeg is required to normalize and assemble audiobook audio")
 
         OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
         project_dir = OUTPUT_ROOT / _safe_project_name(book.title)
@@ -346,8 +364,14 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperat
                     ),
                 )
             batch_args = dict(settings)
-            batch_args.pop("max_chars")
-            batch_args.pop("batch_size")
+            for metadata_key in (
+                "max_chars",
+                "batch_size",
+                "loudness_target_lufs",
+                "true_peak_dbtp",
+                "loudness_range_lu",
+            ):
+                batch_args.pop(metadata_key)
             if seed is not None:
                 batch_args["seed"] = seed + start
             audios = global_model.generate_with_conds(
@@ -363,12 +387,18 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperat
                 waveform = _waveform_for_save(audio, chunk.text, global_model.sr)
                 generated_audio_seconds += waveform.shape[1] / global_model.sr
                 completed_characters += len(chunk.text)
+                chunk_path = chunks_dir / f"{chunk_index:06d}.wav"
                 ta.save(
-                    str(chunks_dir / f"{chunk_index:06d}.wav"),
+                    str(chunk_path),
                     waveform,
                     global_model.sr,
                     encoding="PCM_S",
                     bits_per_sample=16,
+                )
+                normalize_speech_wav(
+                    chunk_path,
+                    global_model.sr,
+                    ffmpeg=ffmpeg,
                 )
             completed_chunks = start + len(batch)
             _write_metadata(
