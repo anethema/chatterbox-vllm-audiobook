@@ -1,4 +1,8 @@
-# Chatterbox TTS on vLLM
+# Chatterbox vLLM Audiobook
+
+This fork of [randombk/chatterbox-vllm](https://github.com/randombk/chatterbox-vllm) adds a Gradio web interface for turning DRM-free EPUB files into audiobooks. It uses sentence-aware text chunking and batched vLLM generation, then creates a chaptered M4B with the EPUB's title, author, cover art, and chapter metadata. Generated speech is normalized to -18 LUFS, progress includes speed and ETA, jobs can be stopped safely, and intermediate chunks are removed after the finished M4B is verified.
+
+## Upstream project: Chatterbox TTS on vLLM
 
 This is a port of https://github.com/resemble-ai/chatterbox to vLLM. Why?
 
