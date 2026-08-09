@@ -255,10 +255,17 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperat
             if generation_control.stop_requested():
                 raise GenerationStopped
             batch = chunks[start:start + batch_size]
-            progress(
-                start / len(chunks),
-                desc=f"Generating chunks {start + 1}–{start + len(batch)} of {len(chunks)}",
-            )
+            # Before the first measurement, show which batch is starting. After
+            # that, leave the latest speed/ETA visible while the next batch runs;
+            # replacing it here made the useful metrics flash too briefly to see.
+            if start == 0:
+                progress(
+                    0,
+                    desc=(
+                        f"Generating chunks {start + 1}–{start + len(batch)} "
+                        f"of {len(chunks)}"
+                    ),
+                )
             batch_args = dict(settings)
             batch_args.pop("max_chars")
             batch_args.pop("batch_size")

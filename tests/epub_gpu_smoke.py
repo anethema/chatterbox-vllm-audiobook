@@ -41,7 +41,7 @@ def main() -> None:
             1.0,
             1.2,
             120,
-            2,
+            1,
             progress=report_progress,
         )
         finished = time.perf_counter()
@@ -57,6 +57,15 @@ def main() -> None:
         print("OUTPUT_BYTES", Path(output).stat().st_size)
         if not any("× realtime" in desc and "ETA" in desc for desc in progress_descriptions):
             raise RuntimeError("Smoke test did not report realtime speed and ETA")
+        first_metrics = next(
+            index for index, desc in enumerate(progress_descriptions)
+            if "× realtime" in desc
+        )
+        if any(
+            desc.startswith("Generating chunks")
+            for desc in progress_descriptions[first_metrics + 1:]
+        ):
+            raise RuntimeError("A generic batch message replaced the visible speed and ETA")
 
         existing_projects = set(app.OUTPUT_ROOT.iterdir())
 
