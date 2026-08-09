@@ -8,13 +8,15 @@ import subprocess
 import time
 import traceback
 from uuid import uuid4
+import wave
 
 import gradio as gr
 import numpy as np
 import torch
 import torchaudio as ta
 
-from chatterbox_vllm.epub import EpubError, TextChunk, chunk_book, load_epub
+from chatterbox_vllm.epub import EpubBook, EpubError, TextChunk, chunk_book, load_epub
+from chatterbox_vllm.m4b import ChapterMarker, build_ffmetadata
 from chatterbox_vllm.progress import GenerationControl, estimate_progress, format_duration
 from chatterbox_vllm.tts import ChatterboxTTS
 
@@ -146,10 +148,16 @@ def _waveform_for_save(waveform, text: str, sample_rate: int) -> torch.Tensor:
     return tensor
 
 
-def _write_metadata(path: Path, title: str, source_path: str, chunks: list[TextChunk],
+def _write_metadata(path: Path, book: EpubBook, source_path: str, chunks: list[TextChunk],
                     settings: dict, completed: int, output_path: str | None = None):
     data = {
-        "title": title,
+        "title": book.title,
+        "authors": list(book.authors),
+        "language": book.language,
+        "publisher": book.publisher,
+        "description": book.description,
+        "date": book.date,
+        "identifier": book.identifier,
         "source_epub": Path(source_path).name,
         "settings": settings,
         "completed_chunks": completed,
@@ -174,10 +182,28 @@ def _write_silence(path: Path, sample_rate: int, duration: float):
     ta.save(str(path), samples, sample_rate, encoding="PCM_S", bits_per_sample=16)
 
 
-def _assemble_audiobook(project_dir: Path, chunks: list[TextChunk], sample_rate: int) -> Path:
+def _wav_duration_ms(path: Path) -> int:
+    with wave.open(str(path), "rb") as audio:
+        return round(audio.getnframes() * 1000 / audio.getframerate())
+
+
+def _cover_suffix(media_type: str) -> str:
+    return {
+        "image/jpeg": ".jpg",
+        "image/jpg": ".jpg",
+        "image/png": ".png",
+    }.get(media_type.lower(), "")
+
+
+def _assemble_audiobook(
+    project_dir: Path,
+    book: EpubBook,
+    chunks: list[TextChunk],
+    sample_rate: int,
+) -> Path:
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
-        raise RuntimeError("FFmpeg is required to assemble the audiobook MP3")
+        raise RuntimeError("FFmpeg is required to assemble the audiobook M4B")
 
     short_pause = project_dir / "pause-between-chunks.wav"
     chapter_pause = project_dir / "pause-between-chapters.wav"
@@ -186,28 +212,71 @@ def _assemble_audiobook(project_dir: Path, chunks: list[TextChunk], sample_rate:
 
     concat_path = project_dir / "concat.txt"
     entries: list[Path] = []
+    chapter_starts: list[tuple[str, int]] = []
+    timeline_ms = 0
     for index, chunk in enumerate(chunks):
+        chapter_changed = index == 0 or chunk.chapter_index != chunks[index - 1].chapter_index
+        if chapter_changed:
+            chapter_starts.append((chunk.chapter_title, timeline_ms))
         if index:
             previous = chunks[index - 1]
-            entries.append(chapter_pause if chunk.chapter_index != previous.chapter_index else short_pause)
-        entries.append(project_dir / "chunks" / f"{index:06d}.wav")
+            pause = chapter_pause if chunk.chapter_index != previous.chapter_index else short_pause
+            entries.append(pause)
+            timeline_ms += _wav_duration_ms(pause)
+        chunk_path = project_dir / "chunks" / f"{index:06d}.wav"
+        entries.append(chunk_path)
+        timeline_ms += _wav_duration_ms(chunk_path)
     concat_path.write_text(
         "".join(f"file '{entry.as_posix()}'\n" for entry in entries),
         encoding="utf-8",
     )
 
-    output_path = project_dir / "audiobook.mp3"
-    result = subprocess.run(
+    markers = [
+        ChapterMarker(
+            title,
+            start,
+            chapter_starts[index + 1][1] if index + 1 < len(chapter_starts) else timeline_ms,
+        )
+        for index, (title, start) in enumerate(chapter_starts)
+    ]
+    ffmetadata_path = project_dir / "audiobook.ffmetadata"
+    ffmetadata_path.write_text(build_ffmetadata(book, markers), encoding="utf-8")
+
+    cover_path = None
+    cover_suffix = _cover_suffix(book.cover_media_type)
+    if book.cover_image and cover_suffix:
+        cover_path = project_dir / f"cover{cover_suffix}"
+        cover_path.write_bytes(book.cover_image)
+
+    output_path = project_dir / "audiobook.m4b"
+    command = [
+        ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "concat", "-safe", "0", "-i", str(concat_path),
+        "-f", "ffmetadata", "-i", str(ffmetadata_path),
+    ]
+    if cover_path:
+        command.extend(["-i", str(cover_path)])
+    command.extend(["-map", "0:a", "-map_metadata", "1", "-map_chapters", "1"])
+    if cover_path:
+        command.extend(
+            [
+                "-map", "2:v:0", "-c:v", "copy", "-disposition:v:0", "attached_pic",
+                "-metadata:s:v:0", "title=Cover",
+            ]
+        )
+    command.extend(
         [
-            ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
-            "-f", "concat", "-safe", "0", "-i", str(concat_path),
-            "-codec:a", "libmp3lame", "-q:a", "2", str(output_path),
-        ],
+            "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart",
+            "-f", "mp4", str(output_path),
+        ]
+    )
+    result = subprocess.run(
+        command,
         capture_output=True,
         text=True,
     )
     if result.returncode != 0:
-        raise RuntimeError(f"FFmpeg failed to assemble the audiobook: {result.stderr.strip()}")
+        raise RuntimeError(f"FFmpeg failed to assemble the M4B: {result.stderr.strip()}")
     return output_path
 
 
@@ -242,7 +311,7 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperat
         chunks_dir = project_dir / "chunks"
         chunks_dir.mkdir(parents=True)
         metadata_path = project_dir / "metadata.json"
-        _write_metadata(metadata_path, book.title, epub_path, chunks, settings, 0)
+        _write_metadata(metadata_path, book, epub_path, chunks, settings, 0)
 
         progress(0, desc=f"Preparing voice for {len(chunks):,} chunks")
         s3gen_ref, cond_emb = global_model.get_audio_conditionals(audio_prompt_path)
@@ -293,7 +362,7 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperat
                 )
             completed_chunks = start + len(batch)
             _write_metadata(
-                metadata_path, book.title, epub_path, chunks, settings,
+                metadata_path, book, epub_path, chunks, settings,
                 completed_chunks,
             )
             elapsed = time.perf_counter() - generation_started
@@ -314,10 +383,10 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperat
             if generation_control.stop_requested():
                 raise GenerationStopped
 
-        progress(0.98, desc="Assembling final MP3")
-        output_path = _assemble_audiobook(project_dir, chunks, global_model.sr)
+        progress(0.98, desc="Assembling chaptered M4B")
+        output_path = _assemble_audiobook(project_dir, book, chunks, global_model.sr)
         relative_output = output_path.relative_to(Path(__file__).resolve().parent).as_posix()
-        _write_metadata(metadata_path, book.title, epub_path, chunks, settings, len(chunks), relative_output)
+        _write_metadata(metadata_path, book, epub_path, chunks, settings, len(chunks), relative_output)
         generation_elapsed = time.perf_counter() - generation_started
         final_speed = generated_audio_seconds / max(generation_elapsed, 1e-9)
         progress(1, desc="Audiobook complete")
@@ -332,7 +401,7 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperat
         print(f"EPUB generation stopped after {completed_chunks} of {len(chunks)} chunks")
         return None, (
             f"⏹️ Generation stopped after {completed_chunks:,} of {len(chunks):,} chunks. "
-            f"Completed chunk files remain in `{project_dir}`; no final MP3 was assembled."
+            f"Completed chunk files remain in `{project_dir}`; no final M4B was assembled."
         )
     except Exception as error:
         traceback.print_exc()
@@ -415,7 +484,7 @@ with gr.Blocks(title="Chatterbox vLLM Audiobook") as demo:
                     epub_btn = gr.Button("Generate EPUB Audiobook", variant="primary")
                     stop_epub_btn = gr.Button("Stop Generation", variant="stop")
                 epub_status = gr.Markdown("")
-                epub_audio_output = gr.Audio(label="Completed Audiobook")
+                epub_audio_output = gr.Audio(label="Completed Audiobook (M4B)")
 
     run_btn.click(
         fn=generate_sample,

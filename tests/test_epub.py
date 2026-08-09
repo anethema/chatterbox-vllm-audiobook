@@ -1,3 +1,4 @@
+import base64
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,10 +15,15 @@ CONTAINER = """<?xml version="1.0"?>
 
 PACKAGE = """<?xml version="1.0"?>
 <package xmlns="http://www.idpf.org/2007/opf" version="3.0">
-  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>Test Book</dc:title></metadata>
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:title>Test Book</dc:title><dc:creator>Test Author</dc:creator>
+    <dc:language>en</dc:language><dc:publisher>Test Publisher</dc:publisher>
+    <dc:identifier>book-id</dc:identifier><meta name="cover" content="cover"/>
+  </metadata>
   <manifest>
     <item id="second" href="second.xhtml" media-type="application/xhtml+xml"/>
     <item id="first" href="first.xhtml" media-type="application/xhtml+xml"/>
+    <item id="cover" href="cover.png" media-type="image/png"/>
   </manifest>
   <spine><itemref idref="first"/><itemref idref="second"/></spine>
 </package>
@@ -37,6 +43,13 @@ def make_epub(path: Path) -> None:
             compress_type=ZIP_DEFLATED,
         )
         archive.writestr(
+            "OEBPS/cover.png",
+            base64.b64decode(
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+            ),
+            compress_type=ZIP_DEFLATED,
+        )
+        archive.writestr(
             "OEBPS/second.xhtml",
             "<html><body><h2>Second Chapter</h2><p>Another sentence!</p></body></html>",
             compress_type=ZIP_DEFLATED,
@@ -51,6 +64,12 @@ class EpubTests(unittest.TestCase):
             book = load_epub(path)
 
         self.assertEqual(book.title, "Test Book")
+        self.assertEqual(book.authors, ("Test Author",))
+        self.assertEqual(book.language, "en")
+        self.assertEqual(book.publisher, "Test Publisher")
+        self.assertEqual(book.identifier, "book-id")
+        self.assertEqual(book.cover_media_type, "image/png")
+        self.assertTrue(book.cover_image.startswith(b"\x89PNG"))
         self.assertEqual([chapter.title for chapter in book.chapters], ["First Chapter", "Second Chapter"])
         self.assertIn("Dr. Rivera arrived.", book.chapters[0].text)
         self.assertNotIn("Skip this", book.chapters[0].text)

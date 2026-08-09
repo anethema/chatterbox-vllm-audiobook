@@ -27,6 +27,14 @@ class EpubChapter:
 class EpubBook:
     title: str
     chapters: tuple[EpubChapter, ...]
+    authors: tuple[str, ...] = ()
+    language: str = ""
+    publisher: str = ""
+    description: str = ""
+    date: str = ""
+    identifier: str = ""
+    cover_image: bytes | None = None
+    cover_media_type: str = ""
 
 
 @dataclass(frozen=True)
@@ -90,6 +98,17 @@ def _first_element(root: ET.Element, name: str) -> ET.Element | None:
     return next((element for element in root.iter() if _local_name(element.tag) == name), None)
 
 
+def _metadata_values(root: ET.Element, name: str) -> tuple[str, ...]:
+    values = []
+    for element in root.iter():
+        if _local_name(element.tag) != name:
+            continue
+        value = " ".join("".join(element.itertext()).split())
+        if value:
+            values.append(value)
+    return tuple(values)
+
+
 def _safe_member_path(opf_path: str, href: str) -> str:
     decoded = unquote(href.split("#", 1)[0])
     member = posixpath.normpath(posixpath.join(posixpath.dirname(opf_path), decoded))
@@ -143,12 +162,12 @@ def load_epub(path: str | Path) -> EpubBook:
         except ET.ParseError as error:
             raise EpubError("EPUB package metadata is invalid") from error
 
-        title_element = _first_element(package_root, "title")
-        book_title = " ".join((title_element.text or "").split()) if title_element is not None else ""
+        titles = _metadata_values(package_root, "title")
+        book_title = titles[0] if titles else ""
         if not book_title:
             book_title = epub_path.stem
 
-        manifest: dict[str, tuple[str, str]] = {}
+        manifest: dict[str, tuple[str, str, str]] = {}
         manifest_element = _first_element(package_root, "manifest")
         if manifest_element is not None:
             for item in manifest_element:
@@ -157,7 +176,11 @@ def load_epub(path: str | Path) -> EpubBook:
                 item_id = item.get("id")
                 href = item.get("href")
                 if item_id and href:
-                    manifest[item_id] = (href, item.get("media-type", ""))
+                    manifest[item_id] = (
+                        href,
+                        item.get("media-type", ""),
+                        item.get("properties", ""),
+                    )
 
         spine_ids: list[str] = []
         spine_element = _first_element(package_root, "spine")
@@ -171,7 +194,7 @@ def load_epub(path: str | Path) -> EpubBook:
         if not spine_ids:
             spine_ids = [
                 item_id
-                for item_id, (_, media_type) in manifest.items()
+                for item_id, (_, media_type, _) in manifest.items()
                 if media_type in {"application/xhtml+xml", "text/html"}
             ]
 
@@ -181,7 +204,7 @@ def load_epub(path: str | Path) -> EpubBook:
             manifest_item = manifest.get(item_id)
             if not manifest_item:
                 continue
-            href, media_type = manifest_item
+            href, media_type, _ = manifest_item
             if media_type not in {"application/xhtml+xml", "text/html", ""}:
                 continue
             member = _safe_member_path(opf_path, href)
@@ -198,7 +221,53 @@ def load_epub(path: str | Path) -> EpubBook:
 
         if not chapters:
             raise EpubError("EPUB contains no readable chapters in its spine")
-        return EpubBook(book_title, tuple(chapters))
+
+        cover_id = ""
+        for element in package_root.iter():
+            if _local_name(element.tag) == "meta" and element.get("name") == "cover":
+                cover_id = element.get("content", "")
+                break
+        cover_item = manifest.get(cover_id) if cover_id else None
+        if cover_item is None:
+            cover_item = next(
+                (
+                    item for item in manifest.values()
+                    if "cover-image" in item[2].split()
+                ),
+                None,
+            )
+        if cover_item is None:
+            cover_item = next(
+                (
+                    item for item_id, item in manifest.items()
+                    if "cover" in item_id.lower() and item[1].startswith("image/")
+                ),
+                None,
+            )
+        cover_image = None
+        cover_media_type = ""
+        if cover_item is not None:
+            cover_href, cover_media_type, _ = cover_item
+            cover_image = _read_member(
+                archive, _safe_member_path(opf_path, cover_href)
+            )
+
+        def first_metadata(name: str) -> str:
+            values = _metadata_values(package_root, name)
+            return values[0] if values else ""
+
+        return EpubBook(
+            book_title,
+            tuple(chapters),
+            authors=_metadata_values(package_root, "creator"),
+            language=first_metadata("language"),
+            publisher=first_metadata("publisher"),
+            description=first_metadata("description"),
+            date=first_metadata("date"),
+            identifier=first_metadata("identifier"),
+            cover_image=cover_image,
+            cover_media_type=cover_media_type,
+        )
 
 
 _ABBREVIATIONS = {

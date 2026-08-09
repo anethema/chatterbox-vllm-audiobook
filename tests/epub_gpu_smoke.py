@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import time
 
@@ -50,11 +51,35 @@ def main() -> None:
         print("MODEL_LOAD_SECONDS", round(loaded - started, 3))
         print("GENERATION_SECONDS", round(finished - loaded, 3))
         if not output or not Path(output).is_file():
-            raise RuntimeError("Smoke test did not create an MP3")
+            raise RuntimeError("Smoke test did not create an M4B")
+        if Path(output).suffix.lower() != ".m4b":
+            raise RuntimeError("Smoke test output does not use the .m4b extension")
         metadata = json.loads((Path(output).parent / "metadata.json").read_text())
         print("COMPLETED_CHUNKS", metadata["completed_chunks"])
         print("TOTAL_CHUNKS", metadata["total_chunks"])
         print("OUTPUT_BYTES", Path(output).stat().st_size)
+        probe = json.loads(
+            subprocess.run(
+                [
+                    "ffprobe", "-v", "error", "-show_entries",
+                    "format_tags:stream=codec_name:chapter=start_time,end_time:chapter_tags",
+                    "-of", "json", output,
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+        )
+        print("M4B_PROBE", json.dumps(probe, sort_keys=True))
+        if probe["streams"][0]["codec_name"] != "aac":
+            raise RuntimeError("M4B audio stream is not AAC")
+        if not any(stream.get("codec_name") == "png" for stream in probe["streams"]):
+            raise RuntimeError("M4B does not contain the EPUB PNG cover")
+        if len(probe.get("chapters", [])) != 2:
+            raise RuntimeError("M4B does not contain two chapter markers")
+        tags = probe.get("format", {}).get("tags", {})
+        if tags.get("title") != "Test Book" or tags.get("artist") != "Test Author":
+            raise RuntimeError("M4B did not preserve EPUB title and author metadata")
         if not any("× realtime" in desc and "ETA" in desc for desc in progress_descriptions):
             raise RuntimeError("Smoke test did not report realtime speed and ETA")
         first_metrics = next(
@@ -98,7 +123,7 @@ def main() -> None:
             raise RuntimeError("Stop smoke test did not create exactly one partial project")
         stopped_project = stopped_projects.pop()
         stopped_metadata = json.loads((stopped_project / "metadata.json").read_text())
-        if stopped_metadata["completed_chunks"] != 1 or (stopped_project / "audiobook.mp3").exists():
+        if stopped_metadata["completed_chunks"] != 1 or (stopped_project / "audiobook.m4b").exists():
             raise RuntimeError("Stopped project metadata or output state is invalid")
     finally:
         if app.global_model is not None:
