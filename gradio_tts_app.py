@@ -536,7 +536,7 @@ with gr.Blocks(title="Chatterbox vLLM Audiobook") as demo:
                         label="Maximum characters per speech chunk",
                     )
                     batch_size = gr.Slider(
-                        1, 32, step=1, value=8,
+                        1, 32, step=1, value=16,
                         label="vLLM batch size",
                     )
                 epub_info = gr.Markdown(
