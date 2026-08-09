@@ -503,6 +503,7 @@ with gr.Blocks(title="Chatterbox vLLM Audiobook") as demo:
                     epub_btn = gr.Button("Generate EPUB Audiobook", variant="primary")
                     stop_epub_btn = gr.Button("Stop Generation", variant="stop")
                 epub_status = gr.Markdown("")
+                epub_result_status = gr.State("")
                 epub_audio_output = gr.Audio(label="Completed Audiobook (M4B)")
 
     run_btn.click(
@@ -523,13 +524,22 @@ with gr.Blocks(title="Chatterbox vLLM Audiobook") as demo:
         inputs=[epub_file, max_chars],
         outputs=epub_info,
     )
-    epub_btn.click(
+    epub_generation_event = epub_btn.click(
         fn=generate_epub_audiobook,
         inputs=[
             epub_file, ref_wav, exaggeration, temp, seed_num, diffusion_steps,
             min_p, top_p, repetition_penalty, max_chars, batch_size,
         ],
-        outputs=[epub_audio_output, epub_status],
+        # Keep the textual result hidden while this event is running. Making a
+        # visible Markdown component a live output causes Gradio to render the
+        # same queue/progress message both there and in its normal progress UI.
+        outputs=[epub_audio_output, epub_result_status],
+    )
+    epub_generation_event.then(
+        fn=lambda status: status,
+        inputs=epub_result_status,
+        outputs=epub_status,
+        queue=False,
     )
     stop_epub_btn.click(
         fn=request_generation_stop,
