@@ -15,6 +15,7 @@ import torch
 import torchaudio as ta
 
 from chatterbox_vllm.epub import EpubError, TextChunk, chunk_book, load_epub
+from chatterbox_vllm.progress import GenerationControl, estimate_progress, format_duration
 from chatterbox_vllm.tts import ChatterboxTTS
 
 
@@ -23,6 +24,11 @@ OUTPUT_ROOT = Path(__file__).resolve().parent / "audiobook_outputs"
 
 config_seed = None
 global_model = None
+generation_control = GenerationControl()
+
+
+class GenerationStopped(Exception):
+    pass
 
 
 def set_seed(seed: int):
@@ -105,6 +111,12 @@ def inspect_epub_file(epub_path, max_chars):
         )
     except EpubError as error:
         return f"❌ {error}"
+
+
+def request_generation_stop():
+    if not generation_control.request_stop():
+        return "No EPUB generation is currently running."
+    return "⏹️ Stop requested. The current vLLM batch will finish, then generation will stop."
 
 
 def _safe_project_name(title: str) -> str:
@@ -209,6 +221,9 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperat
         return None, "❌ Upload or record reference audio first."
 
     project_dir = None
+    chunks = []
+    completed_chunks = 0
+    generation_control.begin()
     try:
         book = load_epub(epub_path)
         chunks = chunk_book(book, max_chars=int(max_chars))
@@ -232,9 +247,18 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperat
         progress(0, desc=f"Preparing voice for {len(chunks):,} chunks")
         s3gen_ref, cond_emb = global_model.get_audio_conditionals(audio_prompt_path)
         batch_size = int(batch_size)
+        total_characters = sum(len(chunk.text) for chunk in chunks)
+        completed_characters = 0
+        generated_audio_seconds = 0.0
+        generation_started = time.perf_counter()
         for start in range(0, len(chunks), batch_size):
+            if generation_control.stop_requested():
+                raise GenerationStopped
             batch = chunks[start:start + batch_size]
-            progress(start / len(chunks), desc=f"Generating chunks {start + 1}–{start + len(batch)} of {len(chunks)}")
+            progress(
+                start / len(chunks),
+                desc=f"Generating chunks {start + 1}–{start + len(batch)} of {len(chunks)}",
+            )
             batch_args = dict(settings)
             batch_args.pop("max_chars")
             batch_args.pop("batch_size")
@@ -251,6 +275,8 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperat
             for offset, (chunk, audio) in enumerate(zip(batch, audios)):
                 chunk_index = start + offset
                 waveform = _waveform_for_save(audio, chunk.text, global_model.sr)
+                generated_audio_seconds += waveform.shape[1] / global_model.sr
+                completed_characters += len(chunk.text)
                 ta.save(
                     str(chunks_dir / f"{chunk_index:06d}.wav"),
                     waveform,
@@ -258,21 +284,55 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperat
                     encoding="PCM_S",
                     bits_per_sample=16,
                 )
-            _write_metadata(metadata_path, book.title, epub_path, chunks, settings, start + len(batch))
+            completed_chunks = start + len(batch)
+            _write_metadata(
+                metadata_path, book.title, epub_path, chunks, settings,
+                completed_chunks,
+            )
+            elapsed = time.perf_counter() - generation_started
+            estimate = estimate_progress(
+                generated_audio_seconds,
+                elapsed,
+                completed_characters,
+                total_characters,
+            )
+            progress(
+                min(0.97, completed_chunks / len(chunks)),
+                desc=(
+                    f"{completed_chunks:,}/{len(chunks):,} chunks • "
+                    f"{estimate.realtime_speed:.2f}× realtime • "
+                    f"ETA {format_duration(estimate.eta_seconds)}"
+                ),
+            )
+            if generation_control.stop_requested():
+                raise GenerationStopped
 
         progress(0.98, desc="Assembling final MP3")
         output_path = _assemble_audiobook(project_dir, chunks, global_model.sr)
         relative_output = output_path.relative_to(Path(__file__).resolve().parent).as_posix()
         _write_metadata(metadata_path, book.title, epub_path, chunks, settings, len(chunks), relative_output)
+        generation_elapsed = time.perf_counter() - generation_started
+        final_speed = generated_audio_seconds / max(generation_elapsed, 1e-9)
         progress(1, desc="Audiobook complete")
         return str(output_path), (
             f"✅ **{book.title}** complete: {len(book.chapters)} chapters and "
-            f"{len(chunks):,} speech chunks. Files were saved under `{project_dir}`."
+            f"{len(chunks):,} speech chunks. Generated "
+            f"{format_duration(generated_audio_seconds)} of audio in "
+            f"{format_duration(generation_elapsed)} ({final_speed:.2f}× realtime). "
+            f"Files were saved under `{project_dir}`."
+        )
+    except GenerationStopped:
+        print(f"EPUB generation stopped after {completed_chunks} of {len(chunks)} chunks")
+        return None, (
+            f"⏹️ Generation stopped after {completed_chunks:,} of {len(chunks):,} chunks. "
+            f"Completed chunk files remain in `{project_dir}`; no final MP3 was assembled."
         )
     except Exception as error:
         traceback.print_exc()
         location = f" Partial files remain in `{project_dir}`." if project_dir else ""
         return None, f"❌ {error}.{location}"
+    finally:
+        generation_control.finish()
 
 
 with gr.Blocks(title="Chatterbox vLLM Audiobook") as demo:
@@ -341,10 +401,13 @@ with gr.Blocks(title="Chatterbox vLLM Audiobook") as demo:
                         1, 32, step=1, value=8,
                         label="vLLM batch size",
                     )
-                epub_status = gr.Markdown(
+                epub_info = gr.Markdown(
                     "Upload a DRM-free EPUB to inspect its chapters before generation."
                 )
-                epub_btn = gr.Button("Generate EPUB Audiobook", variant="primary")
+                with gr.Row():
+                    epub_btn = gr.Button("Generate EPUB Audiobook", variant="primary")
+                    stop_epub_btn = gr.Button("Stop Generation", variant="stop")
+                epub_status = gr.Markdown("")
                 epub_audio_output = gr.Audio(label="Completed Audiobook")
 
     run_btn.click(
@@ -358,12 +421,12 @@ with gr.Blocks(title="Chatterbox vLLM Audiobook") as demo:
     epub_file.change(
         fn=inspect_epub_file,
         inputs=[epub_file, max_chars],
-        outputs=epub_status,
+        outputs=epub_info,
     )
     max_chars.release(
         fn=inspect_epub_file,
         inputs=[epub_file, max_chars],
-        outputs=epub_status,
+        outputs=epub_info,
     )
     epub_btn.click(
         fn=generate_epub_audiobook,
@@ -372,6 +435,11 @@ with gr.Blocks(title="Chatterbox vLLM Audiobook") as demo:
             min_p, top_p, repetition_penalty, max_chars, batch_size,
         ],
         outputs=[epub_audio_output, epub_status],
+    )
+    stop_epub_btn.click(
+        fn=request_generation_stop,
+        outputs=epub_status,
+        queue=False,
     )
 
 
