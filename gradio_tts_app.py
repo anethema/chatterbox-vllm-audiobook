@@ -24,7 +24,12 @@ from chatterbox_vllm.audio import (
 )
 from chatterbox_vllm.background import BackgroundTaskPool
 from chatterbox_vllm.epub import EpubBook, EpubError, TextChunk, chunk_book, load_epub
-from chatterbox_vllm.m4b import ChapterMarker, build_ffmetadata
+from chatterbox_vllm.m4b import (
+    ChapterMarker,
+    build_ffmetadata,
+    delete_intermediate_chunks,
+    verify_m4b,
+)
 from chatterbox_vllm.progress import GenerationControl, estimate_progress, format_duration
 from chatterbox_vllm.tts import ChatterboxTTS
 
@@ -197,7 +202,8 @@ def _save_and_normalize_chunk(
 
 
 def _write_metadata(path: Path, book: EpubBook, source_path: str, chunks: list[TextChunk],
-                    settings: dict, completed: int, output_path: str | None = None):
+                    settings: dict, completed: int, output_path: str | None = None,
+                    chunks_available: bool = True):
     data = {
         "title": book.title,
         "authors": list(book.authors),
@@ -217,7 +223,11 @@ def _write_metadata(path: Path, book: EpubBook, source_path: str, chunks: list[T
                 "chapter_index": chunk.chapter_index,
                 "chapter_title": chunk.chapter_title,
                 "text": chunk.text,
-                "audio_file": f"chunks/{index:06d}.wav" if index < completed else None,
+                "audio_file": (
+                    f"chunks/{index:06d}.wav"
+                    if chunks_available and index < completed
+                    else None
+                ),
             }
             for index, chunk in enumerate(chunks)
         ],
@@ -461,8 +471,20 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperat
         audio_tasks = None
         progress(0.98, desc="Assembling chaptered M4B")
         output_path = _assemble_audiobook(project_dir, book, chunks, global_model.sr)
+        progress(0.99, desc="Verifying completed M4B")
+        verify_m4b(output_path)
+        delete_intermediate_chunks(project_dir)
         relative_output = output_path.relative_to(Path(__file__).resolve().parent).as_posix()
-        _write_metadata(metadata_path, book, epub_path, chunks, settings, len(chunks), relative_output)
+        _write_metadata(
+            metadata_path,
+            book,
+            epub_path,
+            chunks,
+            settings,
+            len(chunks),
+            relative_output,
+            chunks_available=False,
+        )
         generation_elapsed = time.perf_counter() - generation_started
         final_speed = generated_audio_seconds / max(generation_elapsed, 1e-9)
         progress(1, desc="Audiobook complete")
@@ -471,7 +493,7 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperat
             f"{len(chunks):,} speech chunks. Generated "
             f"{format_duration(generated_audio_seconds)} of audio in "
             f"{format_duration(generation_elapsed)} ({final_speed:.2f}× realtime). "
-            f"Files were saved under `{project_dir}`."
+            f"Files were saved under `{project_dir}` and intermediate chunks were removed."
         )
     except GenerationStopped:
         if audio_tasks is not None:
