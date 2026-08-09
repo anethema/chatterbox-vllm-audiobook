@@ -526,7 +526,7 @@ with gr.Blocks(title="Chatterbox vLLM Audiobook") as demo:
                 diffusion_steps = gr.Slider(
                     1, 15, step=1,
                     label="Diffusion Steps (more = slower and higher quality)",
-                    value=10,
+                    value=15,
                 )
                 temp = gr.Slider(0.05, 5, step=.05, label="Temperature", value=.8)
                 min_p = gr.Slider(
