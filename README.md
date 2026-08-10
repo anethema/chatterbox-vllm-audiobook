@@ -51,26 +51,67 @@ DISCLAIMER: THIS IS A PERSONAL PROJECT and is not affiliated with my employer or
 
 # Installation
 
-This project only supports Linux and WSL2 with Nvidia hardware. AMD _may_ work with minor tweaks, but is not tested.
+This fork supports Linux and WSL2 with NVIDIA hardware. A native Windows installation is not supported. AMD hardware may work with additional changes, but it is not tested.
 
-Prerequisites: `git` and [`uv`](https://pypi.org/project/uv/) must be installed
+## Requirements
 
+* An NVIDIA GPU with compute capability 7.0 or newer
+* A working NVIDIA driver (`nvidia-smi` must succeed)
+* Internet access and several gigabytes of free disk space for dependencies and model weights
+* `sudo` access on Debian/Ubuntu when FFmpeg or curl still needs to be installed
+
+The NVIDIA driver is a system prerequisite and is not installed by this project. On WSL2, install the NVIDIA driver on Windows and confirm that `nvidia-smi` works inside WSL before continuing. A separate CUDA Toolkit installation is normally unnecessary because PyTorch and vLLM use prebuilt CUDA wheels.
+
+## Quick installation
+
+```bash
+sudo apt update
+sudo apt install -y git
+
+git clone https://github.com/anethema/chatterbox-vllm-audiobook.git
+cd chatterbox-vllm-audiobook
+
+./install_linux.sh
 ```
-git clone https://github.com/randombk/chatterbox-vllm.git
-cd chatterbox-vllm
-uv venv
-source .venv/bin/activate
-uv sync
+
+The installer adds curl and FFmpeg when needed, installs [`uv`](https://docs.astral.sh/uv/getting-started/installation/), creates a Python 3.12 virtual environment, installs the locked Python dependencies with an automatically selected CUDA-enabled PyTorch build, and verifies that PyTorch can see the GPU. It does not modify or install the NVIDIA driver.
+
+To perform those steps manually instead:
+
+```bash
+sudo apt update
+sudo apt install -y git curl ffmpeg
+
+curl -LsSf https://astral.sh/uv/install.sh | sh
+source "$HOME/.local/bin/env"
+
+git clone https://github.com/anethema/chatterbox-vllm-audiobook.git
+cd chatterbox-vllm-audiobook
+uv sync --python 3.12 --torch-backend=auto
 ```
 
-The package should automatically download the correct model weights from the Hugging Face Hub.
+## Running the web interface
 
-If you encounter CUDA issues, try resetting the venv and using `uv pip install -e .` instead of `uv sync`.
+```bash
+./run_chatterbox_vllm.sh
+```
+
+Open <http://127.0.0.1:7860> in a browser. The first launch downloads the Chatterbox model weights from the Hugging Face Hub and will take longer than subsequent launches. Finished audiobooks are saved below `audiobook_outputs/` in the cloned repository.
+
+The launcher listens on `0.0.0.0:7860` so another computer on the same network can use `http://LINUX_MACHINE_IP:7860`. Only expose that port to networks you trust; Gradio public sharing is disabled.
 
 
 # Updating
 
-If you are updating from a previous version, run `uv sync` to update the dependencies. The package will automatically download the correct model weights from the Hugging Face Hub.
+The default branch is `master`. To update an existing installation:
+
+```bash
+git switch master
+git pull --ff-only origin master
+uv sync --python 3.12 --torch-backend=auto
+```
+
+The package automatically downloads any required model weights from the Hugging Face Hub.
 
 # Example
 
