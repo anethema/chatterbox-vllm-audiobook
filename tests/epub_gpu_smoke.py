@@ -43,6 +43,7 @@ def main() -> None:
             1.2,
             120,
             1,
+            None,
             progress=report_progress,
         )
         finished = time.perf_counter()
@@ -112,6 +113,7 @@ def main() -> None:
             1.2,
             120,
             1,
+            None,
             progress=stop_after_first_batch,
         )
         print("STOPPED_OUTPUT", stopped_output)
