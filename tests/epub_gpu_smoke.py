@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import time
@@ -19,6 +20,8 @@ import gradio_tts_app as app  # noqa: E402
 
 def main() -> None:
     source = Path("/tmp/chatterbox-epub-smoke.epub")
+    app.OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+    projects_before_test = set(app.OUTPUT_ROOT.iterdir())
     make_epub(source)
     started = time.perf_counter()
     app.load_model()
@@ -224,6 +227,10 @@ def main() -> None:
     finally:
         if app.global_model is not None:
             app.global_model.shutdown()
+        for project in set(app.OUTPUT_ROOT.iterdir()) - projects_before_test:
+            if project.is_dir() and project.name.startswith("Test-Book-"):
+                shutil.rmtree(project)
+        source.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
