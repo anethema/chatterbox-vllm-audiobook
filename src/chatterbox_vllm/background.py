@@ -17,6 +17,7 @@ class BackgroundTaskPool:
         )
         self._max_pending = max_pending
         self._pending: set[Future] = set()
+        self._results: list[Any] = []
         self._closed = False
 
     @property
@@ -26,7 +27,7 @@ class BackgroundTaskPool:
     def _resolve(self, completed: set[Future]) -> None:
         self._pending.difference_update(completed)
         for future in completed:
-            future.result()
+            self._results.append(future.result())
 
     def check(self) -> None:
         """Raise failures from completed tasks without waiting for active work."""
@@ -34,6 +35,13 @@ class BackgroundTaskPool:
         completed = {future for future in self._pending if future.done()}
         if completed:
             self._resolve(completed)
+
+    def take_results(self) -> list[Any]:
+        """Return and clear results collected while bounding the task queue."""
+
+        results = self._results
+        self._results = []
+        return results
 
     def submit(
         self,
@@ -77,4 +85,5 @@ class BackgroundTaskPool:
             future.cancel()
         self._executor.shutdown(wait=True, cancel_futures=True)
         self._pending.clear()
+        self._results.clear()
         self._closed = True

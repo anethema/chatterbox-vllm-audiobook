@@ -30,6 +30,11 @@ from chatterbox_vllm.m4b import (
     delete_intermediate_chunks,
     verify_m4b,
 )
+from chatterbox_vllm.memory import read_memory_status, release_unused_memory
+from chatterbox_vllm.projects import (
+    build_resume_plan,
+    incomplete_project_choices,
+)
 from chatterbox_vllm.progress import GenerationControl, estimate_progress, format_duration
 from chatterbox_vllm.tts import ChatterboxTTS
 
@@ -38,6 +43,9 @@ DEVICE = "cuda"
 OUTPUT_ROOT = Path(__file__).resolve().parent / "audiobook_outputs"
 AUDIO_WORKERS = min(4, os.cpu_count() or 1)
 MAX_PENDING_AUDIO_TASKS = AUDIO_WORKERS * 16
+MEMORY_CLEANUP_BATCHES = 64
+MEMORY_CLEANUP_HEADROOM = 4 * 1024 ** 3
+MINIMUM_MEMORY_HEADROOM = 2 * 1024 ** 3
 
 config_seed = None
 global_model = None
@@ -45,6 +53,10 @@ generation_control = GenerationControl()
 
 
 class GenerationStopped(Exception):
+    pass
+
+
+class MemoryPressureError(RuntimeError):
     pass
 
 
@@ -148,6 +160,23 @@ def request_generation_stop():
     return "⏹️ Stop requested. The current vLLM batch will finish, then generation will stop."
 
 
+def refresh_resume_projects():
+    choices = incomplete_project_choices(OUTPUT_ROOT)
+    return gr.Dropdown(choices=choices, value=None)
+
+
+def inspect_resume_project(project_name):
+    if not project_name:
+        return "Select an incomplete project, then upload its original EPUB and reference voice."
+    try:
+        for label, name in incomplete_project_choices(OUTPUT_ROOT):
+            if name == project_name:
+                return f"Selected **{label}**. Resume will validate the uploaded EPUB before writing."
+    except OSError as error:
+        return f"❌ Could not inspect incomplete projects: {error}"
+    return "❌ The selected incomplete project is no longer available."
+
+
 def _safe_project_name(title: str) -> str:
     slug = re.sub(r"[^A-Za-z0-9._-]+", "-", title).strip("-._")
     return (slug[:80] or "audiobook") + "-" + time.strftime("%Y%m%d-%H%M%S") + "-" + uuid4().hex[:6]
@@ -203,6 +232,7 @@ def _save_and_normalize_chunk(
 
 def _write_metadata(path: Path, book: EpubBook, source_path: str, chunks: list[TextChunk],
                     settings: dict, completed: int, output_path: str | None = None,
+                    scheduled: int | None = None,
                     chunks_available: bool = True):
     data = {
         "title": book.title,
@@ -215,6 +245,7 @@ def _write_metadata(path: Path, book: EpubBook, source_path: str, chunks: list[T
         "source_epub": Path(source_path).name,
         "settings": settings,
         "completed_chunks": completed,
+        "scheduled_chunks": completed if scheduled is None else scheduled,
         "total_chunks": len(chunks),
         "output_file": output_path,
         "chunks": [
@@ -233,6 +264,36 @@ def _write_metadata(path: Path, book: EpubBook, source_path: str, chunks: list[T
         ],
     }
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def _record_durable_results(audio_tasks, durable_indices: set[int], durable_chunks: int) -> int:
+    audio_tasks.check()
+    for path in audio_tasks.take_results():
+        durable_indices.add(int(Path(path).stem))
+    while durable_chunks in durable_indices:
+        durable_indices.remove(durable_chunks)
+        durable_chunks += 1
+    return durable_chunks
+
+
+def _protect_system_memory(batch_number: int) -> None:
+    status = read_memory_status()
+    if (
+        batch_number % MEMORY_CLEANUP_BATCHES == 0
+        or status.headroom_bytes < MEMORY_CLEANUP_HEADROOM
+    ):
+        release_unused_memory()
+        status = read_memory_status()
+        print(
+            "[MEMORY] available "
+            f"{status.available_bytes / 1024 ** 3:.2f} GiB + swap free "
+            f"{status.swap_free_bytes / 1024 ** 3:.2f} GiB"
+        )
+    if status.headroom_bytes < MINIMUM_MEMORY_HEADROOM:
+        raise MemoryPressureError(
+            "System memory is critically low. Generation paused before Linux could "
+            "kill the process; restart the app and resume this project"
+        )
 
 
 def _write_silence(path: Path, sample_rate: int, duration: float):
@@ -341,6 +402,7 @@ def _assemble_audiobook(
 def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperature,
                             seed_num, diffusion_steps, min_p, top_p,
                             repetition_penalty, max_chars, batch_size,
+                            resume_project_name,
                             progress=gr.Progress()):
     if not epub_path:
         return None, "❌ Upload an EPUB first."
@@ -350,59 +412,86 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperat
     project_dir = None
     chunks = []
     completed_chunks = 0
+    durable_chunks = 0
+    durable_indices = set()
     audio_tasks = None
+    resuming = bool(resume_project_name)
     generation_control.begin()
     try:
         book = load_epub(epub_path)
-        chunks = chunk_book(book, max_chars=int(max_chars))
-        if not chunks:
-            raise EpubError("EPUB did not produce any speech chunks")
-
-        seed = selected_seed(seed_num)
-        settings = generation_arguments(
-            exaggeration, temperature, diffusion_steps, min_p, top_p,
-            repetition_penalty, seed,
-        )
-        settings.update(
-            {
-                "max_chars": int(max_chars),
-                "batch_size": int(batch_size),
-                "loudness_target_lufs": TARGET_LUFS,
-                "true_peak_dbtp": TRUE_PEAK_DBTP,
-                "loudness_range_lu": LOUDNESS_RANGE_LU,
-            }
-        )
+        if resuming:
+            resume_plan = build_resume_plan(
+                OUTPUT_ROOT, resume_project_name, book, global_model.sr,
+            )
+            project_dir = resume_plan.project_dir
+            chunks = list(resume_plan.chunks)
+            settings = dict(resume_plan.metadata["settings"])
+            seed = settings.get("seed")
+            if seed is not None:
+                set_seed(int(seed))
+            batch_size = int(settings["batch_size"])
+            durable_chunks = resume_plan.resume_index
+            completed_chunks = durable_chunks
+            print(
+                f"Resuming {project_dir.name}: {resume_plan.durable_chunks:,} valid "
+                f"chunks found; restarting at {durable_chunks:,}"
+            )
+        else:
+            chunks = chunk_book(book, max_chars=int(max_chars))
+            if not chunks:
+                raise EpubError("EPUB did not produce any speech chunks")
+            seed = selected_seed(seed_num)
+            settings = generation_arguments(
+                exaggeration, temperature, diffusion_steps, min_p, top_p,
+                repetition_penalty, seed,
+            )
+            settings.update(
+                {
+                    "max_chars": int(max_chars),
+                    "batch_size": int(batch_size),
+                    "loudness_target_lufs": TARGET_LUFS,
+                    "true_peak_dbtp": TRUE_PEAK_DBTP,
+                    "loudness_range_lu": LOUDNESS_RANGE_LU,
+                }
+            )
 
         ffmpeg = shutil.which("ffmpeg")
         if not ffmpeg:
             raise RuntimeError("FFmpeg is required to normalize and assemble audiobook audio")
 
         OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
-        project_dir = OUTPUT_ROOT / _safe_project_name(book.title)
+        project_dir = project_dir or OUTPUT_ROOT / _safe_project_name(book.title)
         chunks_dir = project_dir / "chunks"
-        chunks_dir.mkdir(parents=True)
+        chunks_dir.mkdir(parents=True, exist_ok=resuming)
         audio_tasks = BackgroundTaskPool(
             max_workers=AUDIO_WORKERS,
             max_pending=MAX_PENDING_AUDIO_TASKS,
         )
         metadata_path = project_dir / "metadata.json"
-        _write_metadata(metadata_path, book, epub_path, chunks, settings, 0)
+        _write_metadata(
+            metadata_path, book, epub_path, chunks, settings,
+            durable_chunks, scheduled=durable_chunks,
+        )
 
         progress(0, desc=f"Preparing voice for {len(chunks):,} chunks")
         s3gen_ref, cond_emb = global_model.get_audio_conditionals(audio_prompt_path)
         batch_size = int(batch_size)
-        total_characters = sum(len(chunk.text) for chunk in chunks)
+        remaining_chunks = chunks[durable_chunks:]
+        total_characters = sum(len(chunk.text) for chunk in remaining_chunks)
         completed_characters = 0
         generated_audio_seconds = 0.0
         generation_started = time.perf_counter()
-        for start in range(0, len(chunks), batch_size):
+        for batch_number, start in enumerate(
+            range(durable_chunks, len(chunks), batch_size)
+        ):
             if generation_control.stop_requested():
                 raise GenerationStopped
+            _protect_system_memory(batch_number)
             batch = chunks[start:start + batch_size]
             # Before the first measurement, show which batch is starting. After
             # that, leave the latest speed/ETA visible while the next batch runs;
             # replacing it here made the useful metrics flash too briefly to see.
-            if start == 0:
+            if start == durable_chunks:
                 progress(
                     0,
                     desc=(
@@ -427,7 +516,9 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperat
                 cond_emb=cond_emb,
                 **batch_args,
             )
-            audio_tasks.check()
+            durable_chunks = _record_durable_results(
+                audio_tasks, durable_indices, durable_chunks,
+            )
             if len(audios) != len(batch):
                 raise RuntimeError(f"Model returned {len(audios)} outputs for a batch of {len(batch)}")
             for offset, (chunk, audio) in enumerate(zip(batch, audios)):
@@ -444,9 +535,12 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperat
                     ffmpeg,
                 )
             completed_chunks = start + len(batch)
+            durable_chunks = _record_durable_results(
+                audio_tasks, durable_indices, durable_chunks,
+            )
             _write_metadata(
                 metadata_path, book, epub_path, chunks, settings,
-                completed_chunks,
+                durable_chunks, scheduled=completed_chunks,
             )
             elapsed = time.perf_counter() - generation_started
             estimate = estimate_progress(
@@ -468,7 +562,15 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperat
 
         progress(0.975, desc="Finishing background audio processing")
         audio_tasks.finish()
+        for path in audio_tasks.take_results():
+            durable_indices.add(int(Path(path).stem))
+        while durable_chunks in durable_indices:
+            durable_chunks += 1
         audio_tasks = None
+        _write_metadata(
+            metadata_path, book, epub_path, chunks, settings,
+            len(chunks), scheduled=len(chunks),
+        )
         progress(0.98, desc="Assembling chaptered M4B")
         output_path = _assemble_audiobook(project_dir, book, chunks, global_model.sr)
         progress(0.99, desc="Verifying completed M4B")
@@ -500,6 +602,12 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperat
             audio_tasks.cancel_and_wait()
             audio_tasks = None
         print(f"EPUB generation stopped after {completed_chunks} of {len(chunks)} chunks")
+        if resuming:
+            return None, (
+                f"⏹️ Resumed generation stopped near chunk {completed_chunks:,} of "
+                f"{len(chunks):,}. Existing chunks were preserved and the project "
+                "can be resumed again."
+            )
         try:
             _delete_stopped_project(project_dir)
             return None, (
@@ -518,6 +626,8 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperat
             audio_tasks.cancel_and_wait()
             audio_tasks = None
         traceback.print_exc()
+        if isinstance(error, MemoryPressureError):
+            return None, f"⚠️ {error}. Partial files remain in `{project_dir}`."
         location = f" Partial files remain in `{project_dir}`." if project_dir else ""
         return None, f"❌ {error}.{location}"
     finally:
@@ -586,11 +696,25 @@ with gr.Blocks(title="Chatterbox vLLM Audiobook") as demo:
                 epub_info = gr.Markdown(
                     "Upload a DRM-free EPUB to inspect its chapters before generation."
                 )
+                resume_choices = incomplete_project_choices(OUTPUT_ROOT)
+                with gr.Accordion("Resume an incomplete project", open=False):
+                    resume_project = gr.Dropdown(
+                        choices=resume_choices,
+                        value=None,
+                        label="Incomplete project",
+                    )
+                    refresh_resume_btn = gr.Button("Refresh Incomplete Projects")
+                    resume_info = gr.Markdown(
+                        "Select an incomplete project, then upload its original EPUB "
+                        "and reference voice."
+                    )
                 with gr.Row():
                     epub_btn = gr.Button("Generate EPUB Audiobook", variant="primary")
+                    resume_epub_btn = gr.Button("Resume Selected Project")
                     stop_epub_btn = gr.Button("Stop Generation", variant="stop")
                 epub_status = gr.Markdown("")
                 epub_result_status = gr.State("")
+                new_project_state = gr.State("")
                 epub_audio_output = gr.Audio(label="Completed Audiobook (M4B)")
 
             with gr.Tab("Text Sample"):
@@ -625,11 +749,38 @@ with gr.Blocks(title="Chatterbox vLLM Audiobook") as demo:
         inputs=[
             epub_file, ref_wav, exaggeration, temp, seed_num, diffusion_steps,
             min_p, top_p, repetition_penalty, max_chars, batch_size,
+            new_project_state,
         ],
         # Keep the textual result hidden while this event is running. Making a
         # visible Markdown component a live output causes Gradio to render the
         # same queue/progress message both there and in its normal progress UI.
         outputs=[epub_audio_output, epub_result_status],
+    )
+    resume_generation_event = resume_epub_btn.click(
+        fn=generate_epub_audiobook,
+        inputs=[
+            epub_file, ref_wav, exaggeration, temp, seed_num, diffusion_steps,
+            min_p, top_p, repetition_penalty, max_chars, batch_size,
+            resume_project,
+        ],
+        outputs=[epub_audio_output, epub_result_status],
+    )
+    resume_generation_event.then(
+        fn=lambda status: status,
+        inputs=epub_result_status,
+        outputs=epub_status,
+        queue=False,
+    )
+    refresh_resume_btn.click(
+        fn=refresh_resume_projects,
+        outputs=resume_project,
+        queue=False,
+    )
+    resume_project.change(
+        fn=inspect_resume_project,
+        inputs=resume_project,
+        outputs=resume_info,
+        queue=False,
     )
     epub_generation_event.then(
         fn=lambda status: status,

@@ -100,6 +100,12 @@ Open <http://127.0.0.1:7860> in a browser. The first launch downloads the Chatte
 
 The launcher listens on `0.0.0.0:7860` so another computer on the same network can use `http://LINUX_MACHINE_IP:7860`. Only expose that port to networks you trust; Gradio public sharing is disabled.
 
+## Resuming an interrupted audiobook
+
+Failed conversions retain their validated WAV chunks. Restart the interface, upload the same EPUB and reference voice, open **Resume an incomplete project**, select the project folder, and click **Resume Selected Project**. The app verifies that the EPUB produces the same chunk plan, checks the actual WAV files instead of trusting stale progress metadata, and regenerates the interrupted batch before continuing.
+
+Long jobs monitor Linux RAM and swap. If available memory becomes critically low, generation pauses while preserving the project so it can be resumed after restarting the app. The vLLM multimodal preprocessing cache is disabled because its mirrored frontend/worker caches can otherwise consume roughly 8 GiB during very large conversions.
+
 
 # Updating
 
