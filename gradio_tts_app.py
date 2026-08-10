@@ -34,6 +34,7 @@ from chatterbox_vllm.memory import read_memory_status, release_unused_memory
 from chatterbox_vllm.projects import (
     ResumeProjectError,
     build_resume_plan,
+    contiguous_chunk_count,
     incomplete_project_choices,
     load_project_metadata,
     persist_project_inputs,
@@ -202,16 +203,6 @@ def inspect_resume_project(project_name):
 def _safe_project_name(title: str) -> str:
     slug = re.sub(r"[^A-Za-z0-9._-]+", "-", title).strip("-._")
     return (slug[:80] or "audiobook") + "-" + time.strftime("%Y%m%d-%H%M%S") + "-" + uuid4().hex[:6]
-
-
-def _delete_stopped_project(project_dir: Path) -> None:
-    """Delete only a generated project that is directly below OUTPUT_ROOT."""
-
-    output_root = OUTPUT_ROOT.resolve()
-    target = project_dir.resolve()
-    if target == output_root or target.parent != output_root:
-        raise RuntimeError(f"Refusing to delete unexpected project path: {target}")
-    shutil.rmtree(target)
 
 
 def _waveform_for_save(waveform, text: str, sample_rate: int) -> torch.Tensor:
@@ -660,25 +651,27 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperat
         if audio_tasks is not None:
             audio_tasks.cancel_and_wait()
             audio_tasks = None
-        print(f"EPUB generation stopped after {completed_chunks} of {len(chunks)} chunks")
-        if resuming:
-            return None, (
-                f"⏹️ Resumed generation stopped near chunk {completed_chunks:,} of "
-                f"{len(chunks):,}. Existing chunks were preserved and the project "
-                "can be resumed again."
-            )
         try:
-            _delete_stopped_project(project_dir)
-            return None, (
-                f"⏹️ Generation stopped after {completed_chunks:,} of "
-                f"{len(chunks):,} chunks. The incomplete project and its chunk "
-                "files were deleted."
+            durable_chunks = contiguous_chunk_count(
+                project_dir / "chunks",
+                len(chunks),
+                global_model.sr,
             )
-        except Exception as cleanup_error:
+            write_project_progress(project_dir, durable_chunks, completed_chunks)
+            print(
+                f"EPUB generation stopped with {durable_chunks} of "
+                f"{len(chunks)} chunks safely recorded"
+            )
+            return None, (
+                f"⏹️ Generation stopped with {durable_chunks:,} of "
+                f"{len(chunks):,} chunks safely recorded. The project, saved inputs, "
+                "and chunks were preserved and can be resumed."
+            )
+        except Exception as progress_error:
             traceback.print_exc()
             return None, (
-                f"⚠️ Generation stopped, but the incomplete project could not be "
-                f"deleted: {cleanup_error}"
+                f"⚠️ Generation stopped and project files were preserved, but its "
+                f"progress record could not be updated: {progress_error}"
             )
     except Exception as error:
         if audio_tasks is not None:

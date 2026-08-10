@@ -123,11 +123,37 @@ def main() -> None:
         )
         print("STOPPED_OUTPUT", stopped_output)
         print("STOPPED_STATUS", stopped_status)
-        if stopped_output is not None or "chunk files were deleted" not in stopped_status:
+        if stopped_output is not None or "chunks were preserved" not in stopped_status:
             raise RuntimeError("Cooperative stop did not stop after the first batch")
         stopped_projects = set(app.OUTPUT_ROOT.iterdir()) - existing_projects
-        if stopped_projects:
-            raise RuntimeError("Stopped project directory was not deleted")
+        if len(stopped_projects) != 1:
+            raise RuntimeError("Stopped generation did not preserve one incomplete project")
+        stopped_project = stopped_projects.pop()
+        saved_epub, saved_reference = app.saved_project_inputs(stopped_project)
+        if not saved_epub or not saved_reference:
+            raise RuntimeError("Stopped project did not retain both generation inputs")
+        if not list((stopped_project / "chunks").glob("*.wav")):
+            raise RuntimeError("Stopped project did not retain its completed chunks")
+
+        stop_resumed_output, stop_resumed_status = app.generate_epub_audiobook(
+            None,
+            None,
+            0.5,
+            0.8,
+            0,
+            15,
+            0.05,
+            1.0,
+            1.2,
+            280,
+            16,
+            stopped_project.name,
+            progress=report_progress,
+        )
+        print("STOP_RESUMED_OUTPUT", stop_resumed_output)
+        print("STOP_RESUMED_STATUS", stop_resumed_status)
+        if not stop_resumed_output or not Path(stop_resumed_output).is_file():
+            raise RuntimeError("Stopped project could not be resumed to a completed M4B")
 
         existing_projects = set(app.OUTPUT_ROOT.iterdir())
         protect_memory = app._protect_system_memory
