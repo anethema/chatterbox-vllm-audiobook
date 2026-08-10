@@ -15,4 +15,4 @@ export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export VLLM_USE_V1=1
 export CHATTERBOX_CFG_SCALE="${CHATTERBOX_CFG_SCALE:-0.5}"
 
-exec "${python_bin}" "${project_dir}/gradio_tts_app.py"
+exec "${python_bin}" "${project_dir}/gradio_tts_app.py" "$@"

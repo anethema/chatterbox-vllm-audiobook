@@ -1,3 +1,4 @@
+import argparse
 import json
 import os
 from pathlib import Path
@@ -847,7 +848,18 @@ with gr.Blocks(title="Chatterbox vLLM Audiobook") as demo:
     )
 
 
+def parse_command_line():
+    parser = argparse.ArgumentParser(description="Launch the Chatterbox vLLM web UI")
+    parser.add_argument(
+        "--share",
+        action="store_true",
+        help="create a public Gradio share link (no authentication is configured)",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
+    command_line = parse_command_line()
     # Don't let Gradio manage model loading; it causes issues with vLLM workers.
     os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
     load_model()
@@ -856,4 +868,4 @@ if __name__ == "__main__":
     demo.queue(
         max_size=50,
         default_concurrency_limit=1,
-    ).launch(server_name="0.0.0.0", server_port=7860, share=False)
+    ).launch(server_name="0.0.0.0", server_port=7860, share=command_line.share)
