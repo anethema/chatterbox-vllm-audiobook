@@ -9,6 +9,10 @@ from chatterbox_vllm.projects import (
     ResumeProjectError,
     build_resume_plan,
     incomplete_project_choices,
+    load_project_metadata,
+    persist_project_inputs,
+    saved_project_inputs,
+    write_project_progress,
 )
 
 
@@ -84,6 +88,51 @@ class ResumeProjectTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaisesRegex(ResumeProjectError, "directly below"):
                 build_resume_plan(directory, "../elsewhere", self.book, 24000)
+
+    def test_persists_and_discovers_project_inputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = self.make_project(root)
+            epub = root / "original.epub"
+            reference = root / "voice.MP3"
+            epub.write_bytes(b"epub-data")
+            reference.write_bytes(b"audio-data")
+            saved_epub, saved_reference = persist_project_inputs(
+                project, epub, reference,
+            )
+            discovered = saved_project_inputs(project)
+            self.assertEqual(saved_epub.name, "source.epub")
+            self.assertEqual(saved_reference.name, "reference-audio.mp3")
+            self.assertEqual(saved_epub.read_bytes(), b"epub-data")
+            self.assertEqual(saved_reference.read_bytes(), b"audio-data")
+            self.assertEqual(discovered, (saved_epub, saved_reference))
+
+    def test_replacing_reference_removes_the_previous_format(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = self.make_project(root)
+            epub = root / "original.epub"
+            first = root / "voice.wav"
+            second = root / "voice.flac"
+            epub.write_bytes(b"epub-data")
+            first.write_bytes(b"first")
+            second.write_bytes(b"second")
+            persist_project_inputs(project, epub, first)
+            _, saved_reference = persist_project_inputs(project, epub, second)
+            references = list((project / "inputs").glob("reference-audio.*"))
+        self.assertEqual(saved_reference.name, "reference-audio.flac")
+        self.assertEqual(references, [saved_reference])
+
+    def test_small_progress_file_overrides_stale_metadata_counts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = self.make_project(root)
+            write_project_progress(project, 7, 8)
+            _, metadata = load_project_metadata(root, project.name)
+            progress_size = (project / "progress.json").stat().st_size
+        self.assertEqual(metadata["completed_chunks"], 7)
+        self.assertEqual(metadata["scheduled_chunks"], 8)
+        self.assertLess(progress_size, 200)
 
 
 if __name__ == "__main__":

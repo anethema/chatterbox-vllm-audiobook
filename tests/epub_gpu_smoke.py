@@ -55,6 +55,11 @@ def main() -> None:
             raise RuntimeError("Smoke test did not create an M4B")
         if Path(output).suffix.lower() != ".m4b":
             raise RuntimeError("Smoke test output does not use the .m4b extension")
+        saved_epub, saved_reference = app.saved_project_inputs(Path(output).parent)
+        if not saved_epub or not saved_epub.is_file():
+            raise RuntimeError("Completed project did not retain its source EPUB")
+        if not saved_reference or not saved_reference.is_file():
+            raise RuntimeError("Completed project did not retain its reference audio")
         metadata = json.loads((Path(output).parent / "metadata.json").read_text())
         print("COMPLETED_CHUNKS", metadata["completed_chunks"])
         print("TOTAL_CHUNKS", metadata["total_chunks"])
@@ -159,10 +164,19 @@ def main() -> None:
         if len(paused_projects) != 1:
             raise RuntimeError("Memory-pressure pause did not leave one incomplete project")
         paused_project = paused_projects.pop()
+        saved_epub, saved_reference = app.saved_project_inputs(paused_project)
+        if not saved_epub or not saved_reference:
+            raise RuntimeError("Paused project did not retain both generation inputs")
+        resume_info, loaded_epub, loaded_reference = app.inspect_resume_project(
+            paused_project.name
+        )
+        print("RESUME_INPUT_STATUS", resume_info)
+        if loaded_epub != str(saved_epub) or loaded_reference != str(saved_reference):
+            raise RuntimeError("Resume selection did not restore the saved inputs")
 
         resumed_output, resumed_status = app.generate_epub_audiobook(
-            str(source),
-            "docs/audio-sample-01.mp3",
+            None,
+            None,
             0.5,
             0.8,
             0,

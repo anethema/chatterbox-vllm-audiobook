@@ -4,8 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
 import re
+import shutil
+from uuid import uuid4
 import wave
 
 from chatterbox_vllm.epub import EpubBook, TextChunk, chunk_book
@@ -22,6 +25,12 @@ class ResumePlan:
     chunks: tuple[TextChunk, ...]
     durable_chunks: int
     resume_index: int
+
+
+PROJECT_INPUTS_DIRECTORY = "inputs"
+PROJECT_EPUB_NAME = "source.epub"
+REFERENCE_AUDIO_PREFIX = "reference-audio"
+PROJECT_PROGRESS_NAME = "progress.json"
 
 
 def _project_directory(output_root: str | Path, project_name: str) -> Path:
@@ -46,7 +55,90 @@ def load_project_metadata(output_root: str | Path, project_name: str) -> tuple[P
         raise ResumeProjectError("The selected project's metadata is unreadable") from error
     if metadata.get("output_file"):
         raise ResumeProjectError("The selected project is already complete")
+    progress_path = project / PROJECT_PROGRESS_NAME
+    if progress_path.is_file():
+        try:
+            progress = json.loads(progress_path.read_text(encoding="utf-8"))
+            for key in ("completed_chunks", "scheduled_chunks"):
+                if key in progress:
+                    metadata[key] = int(progress[key])
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            pass
     return project, metadata
+
+
+def write_project_progress(
+    project_dir: str | Path,
+    completed_chunks: int,
+    scheduled_chunks: int,
+) -> Path:
+    project = Path(project_dir)
+    progress_path = project / PROJECT_PROGRESS_NAME
+    temporary = project / f".{PROJECT_PROGRESS_NAME}-{uuid4().hex}.tmp"
+    data = {
+        "completed_chunks": int(completed_chunks),
+        "scheduled_chunks": int(scheduled_chunks),
+    }
+    try:
+        temporary.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        os.replace(temporary, progress_path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return progress_path
+
+
+def saved_project_inputs(project_dir: str | Path) -> tuple[Path | None, Path | None]:
+    inputs = Path(project_dir) / PROJECT_INPUTS_DIRECTORY
+    epub = inputs / PROJECT_EPUB_NAME
+    references = sorted(
+        (path for path in inputs.glob(f"{REFERENCE_AUDIO_PREFIX}.*") if path.is_file()),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    ) if inputs.is_dir() else []
+    return (epub if epub.is_file() else None, references[0] if references else None)
+
+
+def _copy_atomically(source: Path, destination: Path) -> None:
+    if source.resolve() == destination.resolve():
+        return
+    temporary = destination.with_name(f".{destination.name}-{uuid4().hex}.tmp")
+    try:
+        shutil.copy2(source, temporary)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def persist_project_inputs(
+    project_dir: str | Path,
+    epub_path: str | Path,
+    reference_audio_path: str | Path,
+) -> tuple[Path, Path]:
+    """Atomically retain the source EPUB and voice reference with a project."""
+
+    project = Path(project_dir)
+    if not project.is_dir():
+        raise ResumeProjectError("The audiobook project directory is missing")
+    source_epub = Path(epub_path)
+    source_reference = Path(reference_audio_path)
+    if not source_epub.is_file() or source_epub.suffix.lower() != ".epub":
+        raise ResumeProjectError("The source EPUB is missing or invalid")
+    if not source_reference.is_file():
+        raise ResumeProjectError("The reference audio file is missing")
+
+    inputs = project / PROJECT_INPUTS_DIRECTORY
+    inputs.mkdir(exist_ok=True)
+    saved_epub = inputs / PROJECT_EPUB_NAME
+    reference_suffix = source_reference.suffix.lower()
+    if not re.fullmatch(r"\.[a-z0-9]{1,10}", reference_suffix):
+        reference_suffix = ".audio"
+    saved_reference = inputs / f"{REFERENCE_AUDIO_PREFIX}{reference_suffix}"
+    _copy_atomically(source_epub, saved_epub)
+    _copy_atomically(source_reference, saved_reference)
+    for old_reference in inputs.glob(f"{REFERENCE_AUDIO_PREFIX}.*"):
+        if old_reference != saved_reference and old_reference.is_file():
+            old_reference.unlink()
+    return saved_epub, saved_reference
 
 
 def incomplete_project_choices(output_root: str | Path) -> list[tuple[str, str]]:
