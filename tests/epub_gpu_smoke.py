@@ -123,6 +123,64 @@ def main() -> None:
         stopped_projects = set(app.OUTPUT_ROOT.iterdir()) - existing_projects
         if stopped_projects:
             raise RuntimeError("Stopped project directory was not deleted")
+
+        existing_projects = set(app.OUTPUT_ROOT.iterdir())
+        protect_memory = app._protect_system_memory
+
+        def pause_before_second_batch(batch_number):
+            if batch_number == 1:
+                raise app.MemoryPressureError("intentional smoke-test pause")
+            protect_memory(batch_number)
+
+        app._protect_system_memory = pause_before_second_batch
+        try:
+            paused_output, paused_status = app.generate_epub_audiobook(
+                str(source),
+                "docs/audio-sample-01.mp3",
+                0.5,
+                0.8,
+                9012,
+                10,
+                0.05,
+                1.0,
+                1.2,
+                120,
+                1,
+                None,
+                progress=report_progress,
+            )
+        finally:
+            app._protect_system_memory = protect_memory
+        print("PAUSED_OUTPUT", paused_output)
+        print("PAUSED_STATUS", paused_status)
+        if paused_output is not None or "intentional smoke-test pause" not in paused_status:
+            raise RuntimeError("Memory-pressure pause did not preserve the project")
+        paused_projects = set(app.OUTPUT_ROOT.iterdir()) - existing_projects
+        if len(paused_projects) != 1:
+            raise RuntimeError("Memory-pressure pause did not leave one incomplete project")
+        paused_project = paused_projects.pop()
+
+        resumed_output, resumed_status = app.generate_epub_audiobook(
+            str(source),
+            "docs/audio-sample-01.mp3",
+            0.5,
+            0.8,
+            0,
+            15,
+            0.05,
+            1.0,
+            1.2,
+            280,
+            16,
+            paused_project.name,
+            progress=report_progress,
+        )
+        print("RESUMED_OUTPUT", resumed_output)
+        print("RESUMED_STATUS", resumed_status)
+        if not resumed_output or not Path(resumed_output).is_file():
+            raise RuntimeError("Resumed smoke project did not create an M4B")
+        if (paused_project / "chunks").exists():
+            raise RuntimeError("Resumed project retained chunks after verified completion")
     finally:
         if app.global_model is not None:
             app.global_model.shutdown()
