@@ -295,8 +295,6 @@ This remains a personal project built on:
 - [vLLM](https://github.com/vllm-project/vllm)
 - [Gradio](https://www.gradio.app/)
 
-The library examples and architecture diagrams retained from upstream are in the repository root and <code>docs/</code>. The audiobook web interface is the primary workflow for this fork.
-
 The vLLM integration uses internal APIs and is intentionally pinned to vLLM 0.10.0. APIs and model behavior may change on future upgrades.
 
 This project is not affiliated with the maintainer's employer or any other corporate entity. See [LICENSE](LICENSE) for licensing information.
