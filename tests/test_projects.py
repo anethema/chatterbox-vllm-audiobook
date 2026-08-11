@@ -93,6 +93,19 @@ class ResumeProjectTests(unittest.TestCase):
             self.assertEqual(plan.resume_index, len(self.chunks))
             self.assertFalse(stale_temp.exists())
 
+    def test_fully_generated_project_resumes_at_the_assembly_boundary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = self.make_project(root)
+            for index in range(len(self.chunks)):
+                write_wav(project / "chunks" / f"{index:06d}.wav")
+
+            plan = build_resume_plan(root, project.name, self.book, 24000)
+
+        self.assertEqual(plan.durable_chunks, len(self.chunks))
+        self.assertEqual(plan.resume_index, len(self.chunks))
+        self.assertEqual(plan.chunks[plan.resume_index:], ())
+
     def test_rejects_a_different_epub(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
