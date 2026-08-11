@@ -413,10 +413,6 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperat
         )
         epub_path = str(saved_epub)
         audio_prompt_path = str(saved_reference)
-        audio_tasks = BackgroundTaskPool(
-            max_workers=AUDIO_WORKERS,
-            max_pending=MAX_PENDING_AUDIO_TASKS,
-        )
         metadata_path = project_dir / "metadata.json"
         _write_metadata(
             metadata_path, book, source_epub_name, chunks, settings,
@@ -424,14 +420,21 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperat
         )
         write_project_progress(project_dir, durable_chunks, durable_chunks)
 
-        progress(0, desc=f"Preparing voice for {len(chunks):,} chunks")
-        s3gen_ref, cond_emb = global_model.get_audio_conditionals(audio_prompt_path)
         batch_size = int(batch_size)
         remaining_chunks = chunks[durable_chunks:]
         total_characters = sum(len(chunk.text) for chunk in remaining_chunks)
         completed_characters = 0
         generated_audio_seconds = 0.0
         generation_started = time.perf_counter()
+        if remaining_chunks:
+            audio_tasks = BackgroundTaskPool(
+                max_workers=AUDIO_WORKERS,
+                max_pending=MAX_PENDING_AUDIO_TASKS,
+            )
+            progress(0, desc=f"Preparing voice for {len(remaining_chunks):,} remaining chunks")
+            s3gen_ref, cond_emb = global_model.get_audio_conditionals(audio_prompt_path)
+        else:
+            progress(0.975, desc="All speech chunks found; preparing M4B assembly")
         for batch_number, start in enumerate(
             range(durable_chunks, len(chunks), batch_size)
         ):
@@ -508,13 +511,14 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperat
             if generation_control.stop_requested():
                 raise GenerationStopped
 
-        progress(0.975, desc="Finishing background audio processing")
-        audio_tasks.finish()
-        for path in audio_tasks.take_results():
-            durable_indices.add(int(Path(path).stem))
-        while durable_chunks in durable_indices:
-            durable_chunks += 1
-        audio_tasks = None
+        if audio_tasks is not None:
+            progress(0.975, desc="Finishing background audio processing")
+            audio_tasks.finish()
+            for path in audio_tasks.take_results():
+                durable_indices.add(int(Path(path).stem))
+            while durable_chunks in durable_indices:
+                durable_chunks += 1
+            audio_tasks = None
         _write_metadata(
             metadata_path, book, source_epub_name, chunks, settings,
             len(chunks), scheduled=len(chunks),

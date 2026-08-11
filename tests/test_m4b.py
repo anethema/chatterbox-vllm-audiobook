@@ -161,9 +161,9 @@ class M4BTests(unittest.TestCase):
         self.assertEqual(sum(len(segment.entries) for segment in segments), len(entries))
         self.assertEqual(segments[1].entries[0].path.name, "pause.wav")
 
-    def test_defaults_to_eight_m4b_workers_on_32_threads(self):
+    def test_defaults_to_sixteen_m4b_workers_on_32_threads(self):
         with patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(default_m4b_workers(cpu_count=32), 8)
+            self.assertEqual(default_m4b_workers(cpu_count=32), 16)
             self.assertEqual(default_m4b_workers(cpu_count=4), 2)
 
     @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "FFmpeg required")

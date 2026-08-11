@@ -212,7 +212,7 @@ def default_m4b_workers(cpu_count: int | None = None) -> int:
             raise RuntimeError("CHATTERBOX_M4B_WORKERS must be at least 1")
         return workers
     available = os.cpu_count() if cpu_count is None else cpu_count
-    return min(8, max(1, (available or 2) // 2))
+    return min(16, max(1, (available or 2) // 2))
 
 
 def _wav_duration_ms(path: Path) -> int:
