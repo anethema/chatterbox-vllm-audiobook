@@ -16,6 +16,7 @@ The web interface currently targets English narration and defaults to the pinned
 - Progress reporting with generated chunks, realtime speed, and ETA
 - Background WAV saving and normalization while GPU generation continues
 - EBU R128 speech normalization to -18 LUFS for previews and audiobook chunks
+- V3 internal pauses capped at 500 ms without changing edge silence
 - Safe stop and resume with the source EPUB, reference audio, settings, and validated WAVs retained
 - Assembly-only resume when speech generation is already complete
 - Chaptered AAC/M4B output with EPUB metadata and cover artwork
@@ -154,8 +155,9 @@ Current UI defaults:
 | Maximum chunk length | 280 characters |
 | vLLM batch size | 16 |
 | Loudness target | -18 LUFS |
+| V3 maximum internal pause | 500 ms |
 
-Larger batches can improve GPU throughput but increase peak resource use. Diffusion steps primarily trade speed for waveform quality. Extreme sampling or exaggeration settings can reduce stability.
+Larger batches can improve GPU throughput but increase peak resource use. Diffusion steps primarily trade speed for waveform quality. Extreme sampling or exaggeration settings can reduce stability. V3 pause limiting runs with WAV saving and normalization in the bounded CPU background pool, allowing GPU generation to continue with the next batch.
 
 Opening another browser tab does not load another model copy; every tab uses the same server process and model. Do not start overlapping text and EPUB jobs, because separate Gradio events can contend for the same GPU, CPU, and RAM and may make a long conversion appear stalled.
 

@@ -17,8 +17,10 @@ import torchaudio as ta
 
 from chatterbox_vllm.audio import (
     LOUDNESS_RANGE_LU,
+    MAX_INTERNAL_PAUSE_SECONDS,
     TARGET_LUFS,
     TRUE_PEAK_DBTP,
+    limit_internal_pauses_wav,
     normalize_speech_wav,
 )
 from chatterbox_vllm.background import BackgroundTaskPool
@@ -33,6 +35,7 @@ from chatterbox_vllm.m4b import (
 from chatterbox_vllm.memory import read_memory_status, release_unused_memory
 from chatterbox_vllm.model_variants import (
     DEFAULT_MODEL_ID,
+    MULTILINGUAL_V3_MODEL_ID,
     model_label,
     resolve_model_id,
 )
@@ -150,6 +153,8 @@ def generate_sample(text, audio_prompt_path, exaggeration, temperature, seed_num
             bits_per_sample=16,
         )
         normalize_speech_wav(output_path, global_model.sr)
+        if global_model.model_id == MULTILINGUAL_V3_MODEL_ID:
+            limit_internal_pauses_wav(output_path, global_model.sr)
         normalized, sample_rate = ta.load(str(output_path))
     return (sample_rate, normalized.squeeze(0).numpy())
 
@@ -245,6 +250,7 @@ def _save_and_normalize_chunk(
     waveform: torch.Tensor,
     sample_rate: int,
     ffmpeg: str,
+    maximum_internal_pause_seconds: float | None,
 ) -> Path:
     ta.save(
         str(path),
@@ -253,7 +259,14 @@ def _save_and_normalize_chunk(
         encoding="PCM_S",
         bits_per_sample=16,
     )
-    return normalize_speech_wav(path, sample_rate, ffmpeg=ffmpeg)
+    normalize_speech_wav(path, sample_rate, ffmpeg=ffmpeg)
+    if maximum_internal_pause_seconds is not None:
+        limit_internal_pauses_wav(
+            path,
+            sample_rate,
+            maximum_seconds=maximum_internal_pause_seconds,
+        )
+    return path
 
 
 def _write_metadata(path: Path, book: EpubBook, source_path: str, chunks: list[TextChunk],
@@ -412,8 +425,21 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperat
                     "loudness_target_lufs": TARGET_LUFS,
                     "true_peak_dbtp": TRUE_PEAK_DBTP,
                     "loudness_range_lu": LOUDNESS_RANGE_LU,
+                    "maximum_internal_pause_seconds": (
+                        MAX_INTERNAL_PAUSE_SECONDS
+                        if active_project_model_id == MULTILINGUAL_V3_MODEL_ID
+                        else None
+                    ),
                 }
             )
+
+        if active_project_model_id == MULTILINGUAL_V3_MODEL_ID:
+            settings.setdefault(
+                "maximum_internal_pause_seconds",
+                MAX_INTERNAL_PAUSE_SECONDS,
+            )
+        else:
+            settings.setdefault("maximum_internal_pause_seconds", None)
 
         ffmpeg = shutil.which("ffmpeg")
         if not ffmpeg:
@@ -438,17 +464,36 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperat
 
         batch_size = int(batch_size)
         remaining_chunks = chunks[durable_chunks:]
+        maximum_internal_pause_seconds = settings.get(
+            "maximum_internal_pause_seconds"
+        )
         total_characters = sum(len(chunk.text) for chunk in remaining_chunks)
         completed_characters = 0
         generated_audio_seconds = 0.0
         generation_started = time.perf_counter()
-        if remaining_chunks:
+        if remaining_chunks or (
+            durable_chunks and maximum_internal_pause_seconds is not None
+        ):
             audio_tasks = BackgroundTaskPool(
                 max_workers=AUDIO_WORKERS,
                 max_pending=MAX_PENDING_AUDIO_TASKS,
             )
+        if durable_chunks and maximum_internal_pause_seconds is not None:
+            for chunk_index in range(durable_chunks):
+                audio_tasks.submit(
+                    limit_internal_pauses_wav,
+                    chunks_dir / f"{chunk_index:06d}.wav",
+                    global_model.sr,
+                    maximum_seconds=maximum_internal_pause_seconds,
+                )
+        if remaining_chunks:
             progress(0, desc=f"Preparing voice for {len(remaining_chunks):,} remaining chunks")
             s3gen_ref, cond_emb = global_model.get_audio_conditionals(audio_prompt_path)
+        elif audio_tasks is not None:
+            progress(
+                0.975,
+                desc=f"Applying V3 pause limit to {durable_chunks:,} existing chunks",
+            )
         else:
             progress(0.975, desc="All speech chunks found; preparing M4B assembly")
         for batch_number, start in enumerate(
@@ -476,6 +521,7 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperat
                 "loudness_target_lufs",
                 "true_peak_dbtp",
                 "loudness_range_lu",
+                "maximum_internal_pause_seconds",
             ):
                 batch_args.pop(metadata_key)
             if seed is not None:
@@ -503,6 +549,7 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperat
                     waveform,
                     global_model.sr,
                     ffmpeg,
+                    maximum_internal_pause_seconds,
                 )
             completed_chunks = start + len(batch)
             durable_chunks = _record_durable_results(
