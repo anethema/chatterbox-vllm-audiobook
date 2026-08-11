@@ -54,7 +54,7 @@ if [[ ! -x "${uv_bin}" ]]; then
 fi
 
 echo "Creating the Python environment and installing dependencies..."
-"${uv_bin}" sync --python 3.12 --torch-backend=auto
+"${uv_bin}" sync --locked --python 3.12
 
 echo "Verifying CUDA, PyTorch, vLLM, and FFmpeg..."
 "${project_dir}/.venv/bin/python" - <<'PY'

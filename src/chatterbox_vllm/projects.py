@@ -12,6 +12,11 @@ from uuid import uuid4
 import wave
 
 from chatterbox_vllm.epub import EpubBook, TextChunk, chunk_book
+from chatterbox_vllm.model_variants import (
+    LEGACY_PROJECT_MODEL_ID,
+    model_label,
+    resolve_model_id,
+)
 
 
 class ResumeProjectError(ValueError):
@@ -31,6 +36,18 @@ PROJECT_INPUTS_DIRECTORY = "inputs"
 PROJECT_EPUB_NAME = "source.epub"
 REFERENCE_AUDIO_PREFIX = "reference-audio"
 PROJECT_PROGRESS_NAME = "progress.json"
+
+
+def project_model_id(metadata: dict) -> str:
+    """Return a project's model, treating pre-versioning projects as English V1."""
+
+    raw_model_id = metadata.get("model_id", LEGACY_PROJECT_MODEL_ID)
+    try:
+        return resolve_model_id(raw_model_id)
+    except ValueError as error:
+        raise ResumeProjectError(
+            f"The selected project names an unsupported model: {raw_model_id!r}"
+        ) from error
 
 
 def _project_directory(output_root: str | Path, project_name: str) -> Path:
@@ -153,9 +170,13 @@ def incomplete_project_choices(output_root: str | Path) -> list[tuple[str, str]]
             _, metadata = load_project_metadata(root, project.name)
             completed = int(metadata.get("completed_chunks", 0))
             total = int(metadata["total_chunks"])
+            saved_model_label = model_label(project_model_id(metadata))
         except (KeyError, TypeError, ValueError, OSError, ResumeProjectError):
             continue
-        label = f"{project.name} — recorded {completed:,}/{total:,}"
+        label = (
+            f"{project.name} — recorded {completed:,}/{total:,} • "
+            f"{saved_model_label}"
+        )
         choices.append((project.stat().st_mtime, label, project.name))
     choices.sort(reverse=True)
     return [(label, name) for _, label, name in choices]
@@ -218,6 +239,7 @@ def build_resume_plan(
     project_name: str,
     book: EpubBook,
     sample_rate: int,
+    expected_model_id: str | None = None,
 ) -> ResumePlan:
     project, metadata = load_project_metadata(output_root, project_name)
     try:
@@ -249,4 +271,14 @@ def build_resume_plan(
 
     durable = contiguous_chunk_count(project / "chunks", len(chunks), sample_rate)
     resume_index = len(chunks) if durable == len(chunks) else (durable // batch_size) * batch_size
+    saved_model_id = project_model_id(metadata)
+    if expected_model_id is not None:
+        expected_model_id = resolve_model_id(expected_model_id)
+        if resume_index < len(chunks) and saved_model_id != expected_model_id:
+            raise ResumeProjectError(
+                f"This project uses {model_label(saved_model_id)}, but the app is "
+                f"running {model_label(expected_model_id)}. Restart with "
+                f"CHATTERBOX_MODEL_VARIANT={saved_model_id} to resume its remaining "
+                "speech chunks"
+            )
     return ResumePlan(project, metadata, chunks, durable, resume_index)

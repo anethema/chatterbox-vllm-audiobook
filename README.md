@@ -1,84 +1,88 @@
 # Chatterbox vLLM Audiobook
 
-This fork of [randombk/chatterbox-vllm](https://github.com/randombk/chatterbox-vllm) adds a Gradio web interface for turning DRM-free EPUB files into audiobooks. It uses sentence-aware text chunking and batched vLLM generation, then creates a chaptered M4B with the EPUB's title, author, cover art, and chapter metadata. Generated speech is normalized to -18 LUFS, progress includes speed and ETA, jobs can be stopped safely, and intermediate chunks are removed after the finished M4B is verified.
+Turn DRM-free EPUB books into chaptered M4B audiobooks with Chatterbox TTS and vLLM. This fork adds a Gradio web interface, sentence-aware EPUB processing, batched GPU generation, resumable projects, loudness normalization, and parallel FFmpeg assembly to [randombk/chatterbox-vllm](https://github.com/randombk/chatterbox-vllm).
 
-## Upstream project: Chatterbox TTS on vLLM
+The web interface currently targets English narration and defaults to the pinned **Chatterbox Multilingual V3 model in English mode**. The original English and Multilingual V2 checkpoints remain selectable through environment variables for compatibility with older projects.
 
-This is a port of https://github.com/resemble-ai/chatterbox to vLLM. Why?
+> [!IMPORTANT]
+> This project requires Linux or WSL2 and an NVIDIA CUDA GPU. Native Windows execution is not supported. It reads ordinary DRM-free EPUB files; it does not remove DRM.
 
-* Improved performance and more efficient use of GPU memory.
-  * Early benchmarks show ~4x speedup in generation tokens/s without batching, and over 10x with batching. This is a significant improvement over the original Chatterbox implementation, which was bottlenecked by unnecessary CPU-GPU sync/transfers within the HF transformers implementation.
-  * More rigorous benchmarking is WIP, but will likely come after batching is fully fleshed out.
-* Easier integration with state-of-the-art inference infrastructure.
+## Features
 
-DISCLAIMER: THIS IS A PERSONAL PROJECT and is not affiliated with my employer or any other corporate entity in any way. The project is based solely on publicly-available information. All opinions are my own and do not necessarily represent the views of my employer.
-
-## Generation Samples
-
-![Sample 1](docs/audio-sample-01.mp3)
-<audio controls>
-  <source src="docs/audio-sample-01.mp3" type="audio/mp3">
-</audio>
-
-![Sample 2](docs/audio-sample-02.mp3)
-<audio controls>
-  <source src="docs/audio-sample-02.mp3" type="audio/mp3">
-</audio>
-
-![Sample 3](docs/audio-sample-03.mp3)
-<audio controls>
-  <source src="docs/audio-sample-03.mp3" type="audio/mp3">
-</audio>
-
-
-# Project Status: Usable and with Benchmark-Topping Throughput
-
-* ✅ Basic speech cloning with audio and text conditioning.
-* ✅ Outputs match the quality of the original Chatterbox implementation.
-* ✅ Context Free Guidance (CFG) is implemented.
-  * Due to a vLLM limitation, CFG can not be tuned on a per-request basis and can only be configured via the `CHATTERBOX_CFG_SCALE` environment variable.
-* ✅ Exaggeration control is implemented.
-* ✅ vLLM batching is implemented and produces a significant speedup.
-* ℹ️ Project uses vLLM internal APIs and extremely hacky workarounds to get things done.
-  * Refactoring to the idiomatic vLLM way of doing things is WIP, but will require some changes to vLLM.
-  * Until then, this is a Rube Goldberg machine that will likely only work with vLLM 0.9.2.
-  * Follow https://github.com/vllm-project/vllm/issues/21989 for updates.
-* ℹ️ Substantial refactoring is needed to further clean up unnecessary workarounds and code paths.
-* ℹ️ Server API is not implemented and will likely be out-of-scope for this project.
-* ❌ Learned speech positional embeddings are not applied, pending support in vLLM. However, this doesn't seem to be causing a very noticeable degradation in quality.
-* ❌ APIs are not yet stable and may change.
-* ❌ Benchmarks and performance optimizations are not yet implemented.
-
-# Installation
-
-This fork supports Linux and WSL2 with NVIDIA hardware. A native Windows installation is not supported. AMD hardware may work with additional changes, but it is not tested.
+- EPUB upload with title, author, cover, spine order, and chapter extraction
+- Sentence-aware text chunking and batched vLLM speech generation
+- Multilingual V3 in English mode as the default model
+- A text-sample tab for testing a reference voice before starting a book
+- Progress reporting with generated chunks, realtime speed, and ETA
+- Background WAV saving and normalization while GPU generation continues
+- EBU R128 speech normalization to -18 LUFS for previews and audiobook chunks
+- V3 internal pauses capped at 500 ms without changing edge silence
+- Safe stop and resume with the source EPUB, reference audio, settings, and validated WAVs retained
+- Assembly-only resume when speech generation is already complete
+- Chaptered AAC/M4B output with EPUB metadata and cover artwork
+- Parallel FFmpeg encoding pinned to one logical CPU per detected physical core
+- Final M4B verification before intermediate WAV chunks are removed
 
 ## Requirements
 
-* An NVIDIA GPU with compute capability 7.0 or newer
-* A working NVIDIA driver (`nvidia-smi` must succeed)
-* Internet access and several gigabytes of free disk space for dependencies and model weights
-* `sudo` access on Debian/Ubuntu when FFmpeg or curl still needs to be installed
+- x86-64 Linux or WSL2
+- An NVIDIA GPU supported by the pinned PyTorch and vLLM versions
+- A working NVIDIA driver; <code>nvidia-smi</code> must succeed inside Linux
+- Internet access for installation and the first model download
+- At least 20 GB of free disk space for the environment, CUDA libraries, model cache, and outputs
+- Enough system RAM and swap for long books
 
-The NVIDIA driver is a system prerequisite and is not installed by this project. On WSL2, install the NVIDIA driver on Windows and confirm that `nvidia-smi` works inside WSL before continuing. A separate CUDA Toolkit installation is normally unnecessary because PyTorch and vLLM use prebuilt CUDA wheels.
+The default batch size of 16 was tested on an RTX 4090 with 24 GB of VRAM. Smaller GPUs may need a lower batch size. The installer pins Python 3.12, PyTorch 2.7.1, and vLLM 0.10.0 through the committed lockfile.
 
-## Quick installation
+The project does not require a separately installed CUDA Toolkit. PyTorch's Linux package supplies its CUDA runtime dependencies. The NVIDIA driver remains a system prerequisite and is not installed by this repository.
 
-```bash
+## WSL2 preparation
+
+On Windows, install or update WSL from an Administrator PowerShell:
+
+~~~powershell
+wsl --install -d Ubuntu
+wsl --update
+wsl --list --verbose
+~~~
+
+Install a current NVIDIA Windows driver with WSL support. Do **not** install a Linux NVIDIA display driver inside WSL; WSL uses the driver supplied by Windows. Start Ubuntu and verify GPU access:
+
+~~~bash
+nvidia-smi
+~~~
+
+Do not continue until that command displays the NVIDIA GPU without an error.
+
+## Installation
+
+### Recommended installation
+
+Run these commands inside Linux or Ubuntu on WSL2:
+
+~~~bash
 sudo apt update
 sudo apt install -y git
 
 git clone https://github.com/anethema/chatterbox-vllm-audiobook.git
 cd chatterbox-vllm-audiobook
-
 ./install_linux.sh
-```
+~~~
 
-The installer adds curl and FFmpeg when needed, installs [`uv`](https://docs.astral.sh/uv/getting-started/installation/), creates a Python 3.12 virtual environment, installs the locked Python dependencies with an automatically selected CUDA-enabled PyTorch build, and verifies that PyTorch can see the GPU. It does not modify or install the NVIDIA driver.
+The installer:
 
-To perform those steps manually instead:
+1. Confirms that it is running on Linux and that <code>nvidia-smi</code> works.
+2. Installs curl and FFmpeg with APT when they are missing.
+3. Installs [uv](https://docs.astral.sh/uv/) with Astral's official installer when needed.
+4. Creates <code>.venv</code> with Python 3.12.
+5. Installs the exact dependencies in <code>uv.lock</code>.
+6. Verifies CUDA through PyTorch and prints the PyTorch, CUDA runtime, vLLM, GPU, FFmpeg, and FFprobe versions.
 
-```bash
+It does not install or modify the NVIDIA driver.
+
+### Manual installation
+
+~~~bash
 sudo apt update
 sudo apt install -y git curl ffmpeg
 
@@ -87,256 +91,212 @@ source "$HOME/.local/bin/env"
 
 git clone https://github.com/anethema/chatterbox-vllm-audiobook.git
 cd chatterbox-vllm-audiobook
-uv sync --python 3.12 --torch-backend=auto
-```
+uv sync --locked --python 3.12
+~~~
 
-## Running the web interface
+Verify the environment:
 
-```bash
+~~~bash
+.venv/bin/python -c 'import torch, vllm; print(torch.__version__, torch.version.cuda, vllm.__version__); print(torch.cuda.get_device_name(0)); assert torch.cuda.is_available()'
+ffmpeg -version
+ffprobe -version
+~~~
+
+## Running the interface
+
+~~~bash
 ./run_chatterbox_vllm.sh
-```
+~~~
 
-Open <http://127.0.0.1:7860> in a browser. The first launch downloads the Chatterbox model weights from the Hugging Face Hub and will take longer than subsequent launches. Finished audiobooks are saved below `audiobook_outputs/` in the cloned repository.
+Open <http://127.0.0.1:7860>. The server listens on <code>0.0.0.0:7860</code>, so another device on the same trusted network can use:
 
-The launcher listens on `0.0.0.0:7860` so another computer on the same network can use `http://LINUX_MACHINE_IP:7860`. Only expose that port to networks you trust. To request a temporary public Gradio link, launch with:
+~~~text
+http://LINUX_MACHINE_IP:7860
+~~~
 
-```bash
+On WSL2, Windows can normally open the localhost URL directly. Files in the repository are also available from Windows Explorer at a path similar to:
+
+~~~text
+\\wsl.localhost\Ubuntu\home\YOUR_UBUNTU_USER\chatterbox-vllm-audiobook
+~~~
+
+The first launch downloads the pinned model files from [ResembleAI/chatterbox](https://huggingface.co/ResembleAI/chatterbox). Multilingual V3 uses the pinned <code>t3_mtl23ls_v3.safetensors</code> checkpoint plus the shared voice encoder, S3Gen, tokenizer, and conditioning files. Hugging Face normally caches them under <code>~/.cache/huggingface/hub</code>, so later launches reuse the download.
+
+Keep the terminal process running while generating. Closing a browser tab does not unload the model or necessarily cancel a queued server job, but reopening the page does not reconnect to the old progress display. If the process itself stops, resume the saved project after restarting it.
+
+### Temporary public link
+
+~~~bash
 ./run_chatterbox_vllm.sh --share
-```
+~~~
 
-Anyone with that public URL can use the interface; this app does not configure authentication. Stop the process to close the link.
+Gradio prints a temporary <code>gradio.live</code> URL. There is no authentication: anyone with the URL can operate the interface and access generated files exposed by it. Stop the process to close the link.
 
-## Resuming an interrupted audiobook
+## Creating an audiobook
 
-Stopped or failed conversions retain their validated WAV chunks and saved input files. Restart the interface, open **Resume an incomplete project**, select the project folder, and click **Resume Selected Project**. The app restores the saved EPUB and reference voice, verifies that the EPUB produces the same chunk plan, checks the actual WAV files instead of trusting stale progress metadata, and regenerates the interrupted batch before continuing.
+1. Open the **EPUB Audiobook** tab.
+2. Upload or record a clean reference voice sample.
+3. Upload a DRM-free EPUB and review the detected chapter and chunk counts.
+4. Adjust generation settings if needed.
+5. Click **Generate EPUB Audiobook**.
+6. Leave the server process running through both speech generation and M4B assembly.
 
-Long jobs monitor Linux RAM and swap. If available memory becomes critically low, generation pauses while preserving the project so it can be resumed after restarting the app. The vLLM multimodal preprocessing cache is disabled because its mirrored frontend/worker caches can otherwise consume roughly 8 GiB during very large conversions.
+Current UI defaults:
 
+| Setting | Default |
+| --- | ---: |
+| Model | Multilingual V3, English mode |
+| Exaggeration | 0.5 |
+| Diffusion steps | 15 |
+| Temperature | 0.8 |
+| Min-P | 0.05 |
+| Top-P | 1.0 |
+| Repetition penalty | 1.2 |
+| Maximum chunk length | 280 characters |
+| vLLM batch size | 16 |
+| Loudness target | -18 LUFS |
+| V3 maximum internal pause | 500 ms |
 
-# Updating
+Larger batches can improve GPU throughput but increase peak resource use. Diffusion steps primarily trade speed for waveform quality. Extreme sampling or exaggeration settings can reduce stability. V3 pause limiting runs with WAV saving and normalization in the bounded CPU background pool, allowing GPU generation to continue with the next batch.
 
-The default branch is `master`. To update an existing installation:
+Opening another browser tab does not load another model copy; every tab uses the same server process and model. Do not start overlapping text and EPUB jobs, because separate Gradio events can contend for the same GPU, CPU, and RAM and may make a long conversion appear stalled.
 
-```bash
+## Output files
+
+Each conversion creates a timestamped folder beneath <code>audiobook_outputs/</code>:
+
+~~~text
+audiobook_outputs/Book-YYYYMMDD-HHMMSS-ID/
+├── inputs/
+│   ├── source.epub
+│   └── reference-audio.ext
+├── metadata.json
+├── progress.json          # incomplete projects only
+├── chunks/                # incomplete projects only
+└── audiobook.m4b          # completed projects
+~~~
+
+The finished M4B contains AAC audio, chapter markers, and available EPUB title, author, cover, language, publisher, description, date, and identifier metadata.
+
+After assembly, the app uses FFprobe to verify that the M4B contains readable AAC audio with a positive duration. Only after verification succeeds are <code>chunks/</code> and <code>progress.json</code> removed. The saved EPUB, reference voice, metadata, and final M4B remain.
+
+## Stopping and resuming
+
+The **Stop Generation** button requests an orderly stop. Valid normalized WAVs, project metadata, the source EPUB, and the reference voice are preserved.
+
+To resume:
+
+1. Restart the app with the same model used by the project.
+2. Expand **Resume an incomplete project**.
+3. Click **Refresh Incomplete Projects** if necessary.
+4. Select the project; its saved EPUB and reference audio load automatically.
+5. Click **Resume Selected Project**.
+
+Resume validates the saved EPUB's chunk plan and scans the actual WAV files rather than trusting the displayed percentage. It restarts at a safe batch boundary if the final batch was interrupted. When every WAV is already valid, resume skips speech generation and goes directly to M4B assembly.
+
+Projects created before saved inputs were implemented may request the original EPUB and reference audio once. A project with unfinished speech must use its recorded model version so one audiobook cannot silently mix voices from different models.
+
+## Model selection
+
+Multilingual V3 is the normal default for both the EPUB and text-sample tabs:
+
+~~~bash
+./run_chatterbox_vllm.sh
+~~~
+
+Compatibility variants can be selected before launch:
+
+~~~bash
+CHATTERBOX_MODEL_VARIANT=english-v1 ./run_chatterbox_vllm.sh
+CHATTERBOX_MODEL_VARIANT=multilingual-v2 ./run_chatterbox_vllm.sh
+CHATTERBOX_MODEL_VARIANT=multilingual-v3 ./run_chatterbox_vllm.sh
+~~~
+
+The active model is shown at the top of the page and stored in new project metadata. Although V3 uses the multilingual model and tokenizer, this audiobook UI currently invokes it in English mode and does not expose a language selector.
+
+## M4B encoding workers
+
+By default, assembly detects the CPUs available to the process, selects one logical CPU from each physical core, starts that many FFmpeg encoders, and pins one encoder to each selected CPU when Linux permits it.
+
+Override the worker count when needed:
+
+~~~bash
+CHATTERBOX_M4B_WORKERS=8 ./run_chatterbox_vllm.sh
+~~~
+
+CPU-affinity tools such as Process Lasso, container CPU limits, or task affinity inherited by WSL can restrict which cores the app detects.
+
+## Updating
+
+The public release branch is <code>master</code>:
+
+~~~bash
+cd ~/chatterbox-vllm-audiobook
 git switch master
 git pull --ff-only origin master
-uv sync --python 3.12 --torch-backend=auto
-```
+./install_linux.sh
+~~~
 
-The package automatically downloads any required model weights from the Hugging Face Hub.
+Rerunning the installer is safe and synchronizes <code>.venv</code> to the updated lockfile. Model files already present in the Hugging Face cache are reused.
 
-# Example
+Development changes are prepared on feature branches and merged into <code>master</code> after testing.
 
-[This example](https://github.com/randombk/chatterbox-vllm/blob/master/example-tts.py) can be run with `python example-tts.py` to generate audio samples for three different prompts using three different voices.
+## Tests
 
-```python
-import torchaudio as ta
-from chatterbox_vllm.tts import ChatterboxTTS
+Run the unit suite without loading the model:
 
+~~~bash
+.venv/bin/python -m unittest discover -v tests
+~~~
 
-if __name__ == "__main__":
-    model = ChatterboxTTS.from_pretrained(
-        gpu_memory_utilization = 0.4,
-        max_model_len = 1000,
+The first real generation is the practical CUDA/model-load check. Start with a short text sample before converting a long book.
 
-        # Disable CUDA graphs to reduce startup time for one-off generation.
-        enforce_eager = True,
-    )
+## Troubleshooting
 
-    for i, audio_prompt_path in enumerate([None, "docs/audio-sample-01.mp3", "docs/audio-sample-03.mp3"]):
-        prompts = [
-            "You are listening to a demo of the Chatterbox TTS model running on VLLM.",
-            "This is a separate prompt to test the batching implementation.",
-            "And here is a third prompt. It's a bit longer than the first one, but not by much.",
-        ]
-    
-        audios = model.generate(prompts, audio_prompt_path=audio_prompt_path, exaggeration=0.8)
-        for audio_idx, audio in enumerate(audios):
-            ta.save(f"test-{i}-{audio_idx}.mp3", audio, model.sr)
-```
+### <code>nvidia-smi</code> fails
 
-# Multilingual
+Repair or update the host NVIDIA driver first. On WSL2, update WSL with <code>wsl --update</code> from Windows and do not install a Linux display driver inside the distribution.
 
-An early version of Multilingual support is available (see [this example](https://github.com/randombk/chatterbox-vllm/blob/master/example-tts-multilingual.py)). However there *are* quality degradations compared to the original model, driven by:
-* Alignment Stream Analyzer is not implemented, which can result in errors, repetitions, and extra noise at the end of the audio snippet.
-* The lack of learned speech positional encodings is also much more noticible.
-* Russian text stress is not yet implemented.
+### PyTorch reports that CUDA is unavailable
 
-For the list of supported languages, see [here](https://github.com/resemble-ai/chatterbox?tab=readme-ov-file#supported-languages).
+Confirm <code>nvidia-smi</code>, then rerun <code>./install_linux.sh</code>. Do not independently upgrade PyTorch or vLLM; this repository relies on the versions in <code>uv.lock</code>.
 
-# Benchmarks
+### Port 7860 is already in use
 
-To run a benchmark, tweak and run `benchmark.py`.
-The following results were obtained with batching on a 6.6k-word input (`docs/benchmark-text-1.txt`), generating ~40min of audio.
+Another copy of the app is probably running. Stop the older process before launching a replacement:
 
-Notes:
- * I'm not _entirely_ sure what the tokens/s figures from vLLM are showing - the figures probably aren't directly comparable to others, but the results speak for themselves.
- * With vLLM, **the T3 model is no longer the bottleneck**
-   * Vast majority of time is now spent on the S3Gen model, which is not ported/portable to vLLM. This currently uses the original reference implementation from the Chatterbox repo, so there's potential for integrating some of the other community optimizations here.
-   * This also means the vLLM section of the model never fully ramps to its peak throughput in these benchmarks.
- * Benchmarks are done without CUDA graphs, as that is currently causing correctness issues.
- * There are some issues with my very rudimentary chunking logic, which is causing some occasional artifacts in output quality.
+~~~bash
+ss -ltnp | grep ':7860'
+~~~
 
-## Run 1: RTX 3090
+### A long conversion stops or reports an error
 
-**Results using v0.1.3**
+Do not delete its project folder. Restart the app, refresh the incomplete-project list, and resume it. The app preserves validated WAVs on ordinary errors, requested stops, and low-memory pauses.
 
-System Specs:
- * RTX 3090: 24GB VRAM
- * AMD Ryzen 9 7900X @ 5.70GHz
- * 128GB DDR5 4800 MT/s
+### M4B assembly fails
 
-Settings & Results:
-* Input text: `docs/benchmark-text-1.txt` (6.6k words)
-* Input audio: `docs/audio-sample-03.mp3`
-* Exaggeration: 0.5, CFG: 0.5, Temperature: 0.8
-* CUDA graphs disabled, vLLM max memory utilization=0.6
-* Generated output length: 39m54s
-* Wall time: 1m33s (including model load and application init)
-* Generation time (without model startup time): 87s
-  * Time spent in T3 Llama token generation: 13.3s
-  * Time spent in S3Gen waveform generation: 60.8s
+Confirm both tools are available:
 
-Logs:
-```
-[BENCHMARK] Text chunked into 154 chunks
-Giving vLLM 56.48% of GPU memory (13587.20 MB)
-[config.py:1472] Using max model len 1200
-[default_loader.py:272] Loading weights took 0.14 seconds
-[gpu_model_runner.py:1801] Model loading took 1.0179 GiB and 0.198331 seconds
-[gpu_model_runner.py:2238] Encoder cache will be initialized with a budget of 8192 tokens, and profiled with 178 conditionals items of the maximum feature size.
-[gpu_worker.py:232] Available KV cache memory: 11.78 GiB
-[kv_cache_utils.py:716] GPU KV cache size: 102,880 tokens
-[kv_cache_utils.py:720] Maximum concurrency for 1,200 tokens per request: 85.73x
-[BENCHMARK] Model loaded in 7.499186038970947 seconds
-Adding requests: 100%|██████| 154/154 [00:00<00:00, 1105.84it/s]
-Processed prompts: 100%|█████| 154/154 [00:13<00:00, 11.75it/s, est. speed input: 2193.47 toks/s, output: 4577.88 toks/s]
-[T3] Speech Token Generation time: 13.25s
-[S3Gen] Wavform Generation time: 60.85s
-[BENCHMARK] Generation completed in 74.89441227912903 seconds
-[BENCHMARK] Audio saved to benchmark.mp3
-[BENCHMARK] Total time: 87.40947437286377 seconds
+~~~bash
+ffmpeg -version
+ffprobe -version
+~~~
 
-real	1m33.458s
-user	2m21.452s
-sys	0m2.362s
-```
+The intermediate WAVs remain available when final encoding or verification fails, allowing assembly-only resume after the problem is corrected.
 
+### Lower-memory GPU or system
 
-## Run 2: RTX 3060ti
+Try a smaller vLLM batch size and ensure Linux has adequate RAM and swap. Only run one app process; separate processes each load their own model and compete for VRAM.
 
-**Results outdated; using v0.1.0**
+## Scope and upstream
 
-System Specs:
- * RTX 3060ti: 8GB VRAM
- * Intel i7-7700K @ 4.20GHz
- * 32GB DDR4 2133 MT/s
+This remains a personal project built on:
 
-Settings & Results:
-* Input text: `docs/benchmark-text-1.txt` (6.6k words)
-* Input audio: `docs/audio-sample-03.mp3`
-* Exaggeration: 0.5, CFG: 0.5, Temperature: 0.8
-* CUDA graphs disabled, vLLM max memory utilization=0.6
-* Generated output length: 40m15s
-* Wall time: 4m26s
-* Generation time (without model startup time): 238s
-  * Time spent in T3 Llama token generation: 36.4s
-  * Time spent in S3Gen waveform generation: 201s
+- [ResembleAI/chatterbox](https://github.com/resemble-ai/chatterbox)
+- [randombk/chatterbox-vllm](https://github.com/randombk/chatterbox-vllm)
+- [vLLM](https://github.com/vllm-project/vllm)
+- [Gradio](https://www.gradio.app/)
 
-Logs:
-```
-[BENCHMARK] Text chunked into 154 chunks.
-INFO [config.py:1472] Using max model len 1200
-INFO [default_loader.py:272] Loading weights took 0.39 seconds
-INFO [gpu_model_runner.py:1801] Model loading took 1.0107 GiB and 0.497231 seconds
-INFO [gpu_model_runner.py:2238] Encoder cache will be initialized with a budget of 8192 tokens, and profiled with 241 conditionals items of the maximum feature size.
-INFO [gpu_worker.py:232] Available KV cache memory: 3.07 GiB
-INFO [kv_cache_utils.py:716] GPU KV cache size: 26,816 tokens
-INFO [kv_cache_utils.py:720] Maximum concurrency for 1,200 tokens per request: 22.35x
-Adding requests: 100%|████| 40/40 [00:00<00:00, 947.42it/s]
-Processed prompts: 100%|████| 40/40 [00:09<00:00,  4.15it/s, est. speed input: 799.18 toks/s, output: 1654.94 toks/s]
-[T3] Speech Token Generation time: 9.68s
-[S3Gen] Wavform Generation time: 53.66s
-Adding requests: 100%|████| 40/40 [00:00<00:00, 858.75it/s]
-Processed prompts: 100%|████| 40/40 [00:08<00:00,  4.69it/s, est. speed input: 938.19 toks/s, output: 1874.97 toks/s]
-[T3] Speech Token Generation time: 8.58s
-[S3Gen] Wavform Generation time: 53.86s
-Adding requests: 100%|████| 40/40 [00:00<00:00, 815.60it/s]
-Processed prompts: 100%|████| 40/40 [00:09<00:00,  4.19it/s, est. speed input: 726.62 toks/s, output: 1531.24 toks/s]
-[T3] Speech Token Generation time: 9.60s
-[S3Gen] Wavform Generation time: 49.89s
-Adding requests: 100%|████| 34/34 [00:00<00:00, 938.61it/s]
-Processed prompts: 100%|████| 34/34 [00:08<00:00,  3.98it/s, est. speed input: 714.68 toks/s, output: 1439.42 toks/s]
-[T3] Speech Token Generation time: 8.59s
-[S3Gen] Wavform Generation time: 43.58s
-[BENCHMARK] Generation completed in 238.42230987548828 seconds
-[BENCHMARK] Audio saved to benchmark.mp3
-[BENCHMARK] Total time: 259.1808190345764 seconds
+The vLLM integration uses internal APIs and is intentionally pinned to vLLM 0.10.0. APIs and model behavior may change on future upgrades.
 
-real    4m26.803s
-user    4m42.393s
-sys     0m4.285s
-```
-
-
-# Chatterbox Architecture
-
-I could not find an official explanation of the Chatterbox architecture, so below is my best explanation based on the codebase. Chatterbox broadly follows the [CosyVoice](https://funaudiollm.github.io/cosyvoice2/) architecture, applying intermediate fusion multimodal conditioning to a 0.5B parameter Llama model.
-
-<div align="center">
-  <img src="https://github.com/randombk/chatterbox-vllm/raw/refs/heads/master/docs/chatterbox-architecture.svg" alt="Chatterbox Architecture" width="100%" />
-  <p><em>Chatterbox Architecture Diagram</em></p>
-</div>
-
-# Implementation Notes
-
-## CFG Implementation Details
-
-vLLM does not support CFG natively, so substantial hacks were needed to make it work. At a high level, we trick vLLM into thinking the model has double the hidden dimension size as it actually does, then splitting and restacking the states to invoke Llama with double the original batch size. This does pose a risk that vLLM will underestimate the memory requirements of the model - more research is needed into whether vLLM's initial profiling pass will capture this nuance.
-
-
-<div align="center">
-  <img src="https://github.com/randombk/chatterbox-vllm/raw/refs/heads/master/docs/vllm-cfg-impl.svg" alt="vLLM CFG Implementation" width="100%" />
-  <p><em>vLLM CFG Implementation</em></p>
-</div>
-
-# Changelog
-
-## `0.2.1`
-* Updated to multilingual v2
-
-## `0.2.0`
-* Initial multilingual support.
-
-## `0.1.5`
-* Fix Python packaging missing the tokenizer.json file
-
-## `0.1.4`
-* Change default step count back to 10 due to feedback about quality degradation.
-* Fixed a bug in the `gradio_tts_app.py` implementation (#13).
-* Fixed a bug with how symlinks don't work if the module is installed normally (vs as a dev environment) (#12).
-  * The whole structure of how this project should be integrated into downstream repos is something that needs rethinking.
-
-## `0.1.3`
-* Added ability to tweak S3Gen diffusion steps, and default it to 5 (originally 10). This improves performance with nearly indistinguishable quality loss.
-
-## `0.1.2`
-* Update to `vllm 0.10.0`
-* Fixed error where batched requests sometimes get truncated, or otherwise jumbled.
-  * This also removes the need to double-apply batching when submitting requests. You can submit as many prompts as you'd like into the `generate` function, and `vllm` should perform the batching internally without issue. See changes to `benchmark.py` for details.
-  * There is still a (very rare, theoretical) possibility that this issue can still happen. If it does, submit a ticket with repro steps, and tweak your max batch size or max token count as a workaround.
-
-
-## `0.1.1`
-* Misc minor cleanups
-* API changes:
-  * Use `max_batch_size` instead of `gpu_memory_utilization`
-  * Use `compile=False` (default) instead of `enforce_eager=True`
-  * Look at the latest examples to follow API changes. As a reminder, I do not expect the API to become stable until `1.0.0`.
-
-## `0.1.0`
-* Initial publication to pypi
-* Moved audio conditioning processing out of vLLM to avoid re-computing it for every request.
-
-## `0.0.1`
-* Initial release
+This project is not affiliated with the maintainer's employer or any other corporate entity. See [LICENSE](LICENSE) for licensing information.

@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import os
 from pathlib import Path
 from typing import Optional, Union, Tuple, Any
 import time
@@ -14,13 +15,19 @@ from safetensors.torch import load_file
 
 from chatterbox_vllm.models.t3.modules.t3_config import T3Config
 
-from .models.s3tokenizer import S3_SR, drop_invalid_tokens
+from .models.s3tokenizer import S3_SR, S3_TOKEN_RATE, drop_invalid_tokens
 from .models.s3gen import S3GEN_SR, S3Gen
 from .models.voice_encoder import VoiceEncoder
 from .models.t3 import SPEECH_TOKEN_OFFSET
 from .models.t3.modules.cond_enc import T3Cond, T3CondEnc
 from .models.t3.modules.learned_pos_emb import LearnedPositionEmbeddings
 from .text_utils import punc_norm, SUPPORTED_LANGUAGES
+from .model_variants import (
+    ENGLISH_V1_MODEL_ID,
+    MULTILINGUAL_CHECKPOINTS,
+    MULTILINGUAL_V2_MODEL_ID,
+    resolve_model_id,
+)
 
 REPO_ID = "ResembleAI/chatterbox"
 
@@ -65,7 +72,7 @@ class ChatterboxTTS:
                  t3: LLM, t3_config: T3Config, t3_cond_enc: T3CondEnc, 
                  t3_speech_emb: torch.nn.Embedding, t3_speech_pos_emb: LearnedPositionEmbeddings,
                  s3gen: S3Gen, ve: VoiceEncoder, default_conds: Conditionals,
-                 variant: str = "english"):
+                 variant: str = "english", model_id: str = ENGLISH_V1_MODEL_ID):
         self.target_device = target_device
         self.max_model_len = max_model_len
         self.t3 = t3
@@ -78,6 +85,7 @@ class ChatterboxTTS:
         self.ve = ve
         self.default_conds = default_conds
         self.variant = variant
+        self.model_id = resolve_model_id(model_id)
 
     @property
     def sr(self) -> int:
@@ -89,16 +97,35 @@ class ChatterboxTTS:
                    max_model_len: int = 1000, compile: bool = False,
                    max_batch_size: int = 10,
                    variant: str = "english",
+                   model_id: str | None = None,
 
                    # Original Chatterbox defaults this to False. I don't see a substantial performance difference when running with FP16.
                    s3gen_use_fp16: bool = False,
                    **kwargs) -> 'ChatterboxTTS':
         ckpt_dir = Path(ckpt_dir)
 
+        if model_id is None:
+            model_id = (
+                ENGLISH_V1_MODEL_ID
+                if variant == "english"
+                else MULTILINGUAL_V2_MODEL_ID
+            )
+        model_id = resolve_model_id(model_id)
+        expected_variant = "english" if model_id == ENGLISH_V1_MODEL_ID else "multilingual"
+        if variant != expected_variant:
+            raise ValueError(
+                f"Model {model_id} requires variant={expected_variant!r}, got {variant!r}"
+            )
+
         t3_config = T3Config()
 
         # Load *just* the necessary weights to perform inference with T3CondEnc
-        t3_weights = load_file(ckpt_dir / ("t3_cfg.safetensors" if variant == "english" else "t3_mtl23ls_v2.safetensors"))
+        t3_filename = (
+            "t3_cfg.safetensors"
+            if variant == "english"
+            else MULTILINGUAL_CHECKPOINTS[model_id][0]
+        )
+        t3_weights = load_file(ckpt_dir / t3_filename)
 
         t3_enc = T3CondEnc(t3_config)
         t3_enc.load_state_dict({ k.replace('cond_enc.', ''):v for k,v in t3_weights.items() if k.startswith('cond_enc.') })
@@ -122,6 +149,17 @@ class ChatterboxTTS:
         vllm_memory_percent = vllm_memory_needed / unused_gpu_memory
 
         print(f"Giving vLLM {vllm_memory_percent * 100:.2f}% of GPU memory ({vllm_memory_needed / 1024**2:.2f} MB)")
+
+        if variant == "multilingual":
+            tokenizer_path = ckpt_dir / "grapheme_mtl_merged_expanded_v1.json"
+            if not tokenizer_path.is_file():
+                raise FileNotFoundError(
+                    f"Multilingual tokenizer is missing: {tokenizer_path}"
+                )
+            # The custom tokenizer is instantiated inside vLLM and may live in a
+            # worker process, so pass the pinned checkpoint path through its
+            # environment rather than relying on the package's legacy V2 copy.
+            os.environ["CHATTERBOX_MTL_TOKENIZER_FILE"] = str(tokenizer_path.resolve())
 
         base_vllm_kwargs = {
             "model": "./t3-model" if variant == "english" else "./t3-model-multilingual",
@@ -156,7 +194,7 @@ class ChatterboxTTS:
             target_device=target_device, max_model_len=max_model_len,
             t3=t3, t3_config=t3_config, t3_cond_enc=t3_enc, t3_speech_emb=t3_speech_emb, t3_speech_pos_emb=t3_speech_pos_emb,
             s3gen=s3gen, ve=ve, default_conds=default_conds,
-            variant=variant,
+            variant=variant, model_id=model_id,
         )
 
     @classmethod
@@ -173,23 +211,54 @@ class ChatterboxTTS:
         model_safetensors_path.unlink(missing_ok=True)
         model_safetensors_path.symlink_to(t3_cfg_path)
 
-        return cls.from_local(Path(local_path).parent, variant="english", *args, **kwargs)
+        return cls.from_local(
+            Path(local_path).parent,
+            variant="english",
+            model_id=ENGLISH_V1_MODEL_ID,
+            *args,
+            **kwargs,
+        )
 
     @classmethod
     def from_pretrained_multilingual(cls,
                                     repo_id: str = REPO_ID,
-                                    revision: str = "05e904af2b5c7f8e482687a9d7336c5c824467d9",
+                                    revision: str | None = None,
+                                    model_id: str = MULTILINGUAL_V2_MODEL_ID,
                                     *args, **kwargs) -> 'ChatterboxTTS':
-        for fpath in ["ve.safetensors", "t3_mtl23ls_v2.safetensors", "s3gen.safetensors", "grapheme_mtl_merged_expanded_v1.json", "conds.pt", "Cangjie5_TC.json"]:
+        model_id = resolve_model_id(model_id)
+        if model_id == ENGLISH_V1_MODEL_ID:
+            raise ValueError("Use from_pretrained() for the original English model")
+        t3_filename, default_revision = MULTILINGUAL_CHECKPOINTS[model_id]
+        revision = revision or default_revision
+        for fpath in ["ve.safetensors", t3_filename, "s3gen.safetensors", "grapheme_mtl_merged_expanded_v1.json", "conds.pt", "Cangjie5_TC.json"]:
             local_path = hf_hub_download(repo_id=repo_id, filename=fpath, revision=revision)
 
         # Ensure the symlink in './t3-model-multilingual/model.safetensors' points to t3_cfg_path
-        t3_cfg_path = Path(local_path).parent / "t3_mtl23ls_v2.safetensors"
+        t3_cfg_path = Path(local_path).parent / t3_filename
         model_safetensors_path = Path.cwd() / "t3-model-multilingual" / "model.safetensors"
         model_safetensors_path.unlink(missing_ok=True)
         model_safetensors_path.symlink_to(t3_cfg_path)
 
-        return cls.from_local(Path(local_path).parent, variant="multilingual", *args, **kwargs)
+        return cls.from_local(
+            Path(local_path).parent,
+            variant="multilingual",
+            model_id=model_id,
+            *args,
+            **kwargs,
+        )
+
+    @classmethod
+    def from_model_id(cls, model_id: str, *args, **kwargs) -> 'ChatterboxTTS':
+        """Load one of the stable model variants used by project metadata."""
+
+        model_id = resolve_model_id(model_id)
+        if model_id == ENGLISH_V1_MODEL_ID:
+            return cls.from_pretrained(*args, **kwargs)
+        return cls.from_pretrained_multilingual(
+            model_id=model_id,
+            *args,
+            **kwargs,
+        )
     
     def get_supported_languages(self) -> dict[str, str]:
         """Return dictionary of supported language codes and names."""
@@ -253,7 +322,7 @@ class ChatterboxTTS:
 
         # From original Chatterbox HF generation args
         top_p=0.8,
-        repetition_penalty=2.0,
+        repetition_penalty=1.2,
 
         # Supports anything in https://docs.vllm.ai/en/v0.9.2/api/vllm/index.html?h=samplingparams#vllm.SamplingParams
         *args, **kwargs,
@@ -358,15 +427,28 @@ class ChatterboxTTS:
                     if i % 10 == 0:
                         torch.cuda.empty_cache()
 
-                    speech_tokens = torch.tensor([token - SPEECH_TOKEN_OFFSET for token in output.token_ids], device="cuda")
+                    speech_tokens = torch.tensor(
+                        [token - SPEECH_TOKEN_OFFSET for token in output.token_ids],
+                        device=self.target_device,
+                    )
                     speech_tokens = drop_invalid_tokens(speech_tokens)
                     speech_tokens = speech_tokens[speech_tokens < 6561]
+
+                    if speech_tokens.numel() == 0:
+                        raise RuntimeError("T3 produced no valid speech tokens")
 
                     wav, _ = self.s3gen.inference(
                         speech_tokens=speech_tokens,
                         ref_dict=s3gen_ref,
                         n_timesteps=diffusion_steps,
                     )
+                    if self.variant == "multilingual":
+                        # Resemble's current multilingual inference drops the
+                        # final token's audio because attention degrades just
+                        # before EOS and can produce about 40 ms of noise.
+                        token_count = int(speech_tokens.shape[-1])
+                        clean_tokens = max(1, token_count - 1)
+                        wav = wav[..., :clean_tokens * (S3GEN_SR // S3_TOKEN_RATE)]
                     results.append(wav.cpu())
             s3gen_gen_time = time.time() - start_time
             print(f"[S3Gen] Wavform Generation time: {s3gen_gen_time:.2f}s")

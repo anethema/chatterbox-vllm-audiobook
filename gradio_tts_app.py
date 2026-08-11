@@ -17,8 +17,10 @@ import torchaudio as ta
 
 from chatterbox_vllm.audio import (
     LOUDNESS_RANGE_LU,
+    MAX_INTERNAL_PAUSE_SECONDS,
     TARGET_LUFS,
     TRUE_PEAK_DBTP,
+    limit_internal_pauses_wav,
     normalize_speech_wav,
 )
 from chatterbox_vllm.background import BackgroundTaskPool
@@ -31,6 +33,12 @@ from chatterbox_vllm.m4b import (
     verify_m4b,
 )
 from chatterbox_vllm.memory import read_memory_status, release_unused_memory
+from chatterbox_vllm.model_variants import (
+    DEFAULT_MODEL_ID,
+    MULTILINGUAL_V3_MODEL_ID,
+    model_label,
+    resolve_model_id,
+)
 from chatterbox_vllm.projects import (
     ResumeProjectError,
     build_resume_plan,
@@ -38,6 +46,7 @@ from chatterbox_vllm.projects import (
     incomplete_project_choices,
     load_project_metadata,
     persist_project_inputs,
+    project_model_id,
     saved_project_inputs,
     write_project_progress,
 )
@@ -47,6 +56,9 @@ from chatterbox_vllm.tts import ChatterboxTTS
 
 DEVICE = "cuda"
 OUTPUT_ROOT = Path(__file__).resolve().parent / "audiobook_outputs"
+ACTIVE_MODEL_ID = resolve_model_id(
+    os.environ.get("CHATTERBOX_MODEL_VARIANT", DEFAULT_MODEL_ID)
+)
 AUDIO_WORKERS = min(4, os.cpu_count() or 1)
 MAX_PENDING_AUDIO_TASKS = AUDIO_WORKERS * 16
 MEMORY_CLEANUP_BATCHES = 64
@@ -85,9 +97,10 @@ def selected_seed(seed_num) -> int | None:
 
 
 def load_model():
-    print("Loading model...")
+    print(f"Loading {model_label(ACTIVE_MODEL_ID)} ({ACTIVE_MODEL_ID})...")
     global global_model
-    global_model = ChatterboxTTS.from_pretrained(
+    global_model = ChatterboxTTS.from_model_id(
+        ACTIVE_MODEL_ID,
         gpu_memory_utilization=0.6,
         max_model_len=1000,
 
@@ -140,6 +153,8 @@ def generate_sample(text, audio_prompt_path, exaggeration, temperature, seed_num
             bits_per_sample=16,
         )
         normalize_speech_wav(output_path, global_model.sr)
+        if global_model.model_id == MULTILINGUAL_V3_MODEL_ID:
+            limit_internal_pauses_wav(output_path, global_model.sr)
         normalized, sample_rate = ta.load(str(output_path))
     return (sample_rate, normalized.squeeze(0).numpy())
 
@@ -235,6 +250,7 @@ def _save_and_normalize_chunk(
     waveform: torch.Tensor,
     sample_rate: int,
     ffmpeg: str,
+    maximum_internal_pause_seconds: float | None,
 ) -> Path:
     ta.save(
         str(path),
@@ -243,11 +259,19 @@ def _save_and_normalize_chunk(
         encoding="PCM_S",
         bits_per_sample=16,
     )
-    return normalize_speech_wav(path, sample_rate, ffmpeg=ffmpeg)
+    normalize_speech_wav(path, sample_rate, ffmpeg=ffmpeg)
+    if maximum_internal_pause_seconds is not None:
+        limit_internal_pauses_wav(
+            path,
+            sample_rate,
+            maximum_seconds=maximum_internal_pause_seconds,
+        )
+    return path
 
 
 def _write_metadata(path: Path, book: EpubBook, source_path: str, chunks: list[TextChunk],
-                    settings: dict, completed: int, output_path: str | None = None,
+                    settings: dict, completed: int, model_id: str,
+                    output_path: str | None = None,
                     scheduled: int | None = None,
                     chunks_available: bool = True):
     saved_epub, saved_reference = saved_project_inputs(path.parent)
@@ -259,6 +283,7 @@ def _write_metadata(path: Path, book: EpubBook, source_path: str, chunks: list[T
         "description": book.description,
         "date": book.date,
         "identifier": book.identifier,
+        "model_id": resolve_model_id(model_id),
         "source_epub": Path(source_path).name,
         "project_epub_file": (
             saved_epub.relative_to(path.parent).as_posix() if saved_epub else None
@@ -357,6 +382,7 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperat
     durable_chunks = 0
     durable_indices = set()
     audio_tasks = None
+    active_project_model_id = global_model.model_id
     generation_control.begin()
     try:
         book = load_epub(epub_path)
@@ -364,10 +390,12 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperat
         if resuming:
             resume_plan = build_resume_plan(
                 OUTPUT_ROOT, resume_project_name, book, global_model.sr,
+                expected_model_id=global_model.model_id,
             )
             project_dir = resume_plan.project_dir
             chunks = list(resume_plan.chunks)
             settings = dict(resume_plan.metadata["settings"])
+            active_project_model_id = project_model_id(resume_plan.metadata)
             source_epub_name = resume_plan.metadata.get(
                 "source_epub", source_epub_name,
             )
@@ -397,8 +425,21 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperat
                     "loudness_target_lufs": TARGET_LUFS,
                     "true_peak_dbtp": TRUE_PEAK_DBTP,
                     "loudness_range_lu": LOUDNESS_RANGE_LU,
+                    "maximum_internal_pause_seconds": (
+                        MAX_INTERNAL_PAUSE_SECONDS
+                        if active_project_model_id == MULTILINGUAL_V3_MODEL_ID
+                        else None
+                    ),
                 }
             )
+
+        if active_project_model_id == MULTILINGUAL_V3_MODEL_ID:
+            settings.setdefault(
+                "maximum_internal_pause_seconds",
+                MAX_INTERNAL_PAUSE_SECONDS,
+            )
+        else:
+            settings.setdefault("maximum_internal_pause_seconds", None)
 
         ffmpeg = shutil.which("ffmpeg")
         if not ffmpeg:
@@ -416,23 +457,43 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperat
         metadata_path = project_dir / "metadata.json"
         _write_metadata(
             metadata_path, book, source_epub_name, chunks, settings,
-            durable_chunks, scheduled=durable_chunks,
+            durable_chunks, active_project_model_id,
+            scheduled=durable_chunks,
         )
         write_project_progress(project_dir, durable_chunks, durable_chunks)
 
         batch_size = int(batch_size)
         remaining_chunks = chunks[durable_chunks:]
+        maximum_internal_pause_seconds = settings.get(
+            "maximum_internal_pause_seconds"
+        )
         total_characters = sum(len(chunk.text) for chunk in remaining_chunks)
         completed_characters = 0
         generated_audio_seconds = 0.0
         generation_started = time.perf_counter()
-        if remaining_chunks:
+        if remaining_chunks or (
+            durable_chunks and maximum_internal_pause_seconds is not None
+        ):
             audio_tasks = BackgroundTaskPool(
                 max_workers=AUDIO_WORKERS,
                 max_pending=MAX_PENDING_AUDIO_TASKS,
             )
+        if durable_chunks and maximum_internal_pause_seconds is not None:
+            for chunk_index in range(durable_chunks):
+                audio_tasks.submit(
+                    limit_internal_pauses_wav,
+                    chunks_dir / f"{chunk_index:06d}.wav",
+                    global_model.sr,
+                    maximum_seconds=maximum_internal_pause_seconds,
+                )
+        if remaining_chunks:
             progress(0, desc=f"Preparing voice for {len(remaining_chunks):,} remaining chunks")
             s3gen_ref, cond_emb = global_model.get_audio_conditionals(audio_prompt_path)
+        elif audio_tasks is not None:
+            progress(
+                0.975,
+                desc=f"Applying V3 pause limit to {durable_chunks:,} existing chunks",
+            )
         else:
             progress(0.975, desc="All speech chunks found; preparing M4B assembly")
         for batch_number, start in enumerate(
@@ -460,6 +521,7 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperat
                 "loudness_target_lufs",
                 "true_peak_dbtp",
                 "loudness_range_lu",
+                "maximum_internal_pause_seconds",
             ):
                 batch_args.pop(metadata_key)
             if seed is not None:
@@ -487,6 +549,7 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperat
                     waveform,
                     global_model.sr,
                     ffmpeg,
+                    maximum_internal_pause_seconds,
                 )
             completed_chunks = start + len(batch)
             durable_chunks = _record_durable_results(
@@ -521,7 +584,7 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperat
             audio_tasks = None
         _write_metadata(
             metadata_path, book, source_epub_name, chunks, settings,
-            len(chunks), scheduled=len(chunks),
+            len(chunks), active_project_model_id, scheduled=len(chunks),
         )
         write_project_progress(project_dir, len(chunks), len(chunks))
         progress(0.98, desc="Preparing parallel M4B encoding")
@@ -562,6 +625,7 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperat
             chunks,
             settings,
             len(chunks),
+            active_project_model_id,
             relative_output,
             chunks_available=False,
         )
@@ -618,7 +682,11 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperat
 
 
 with gr.Blocks(title="Chatterbox vLLM Audiobook") as demo:
-    gr.Markdown("# Chatterbox vLLM\nQuick voice tests and batched EPUB audiobook generation.")
+    gr.Markdown(
+        "# Chatterbox vLLM\n"
+        "Quick voice tests and batched EPUB audiobook generation.  \n"
+        f"**Active model:** {model_label(ACTIVE_MODEL_ID)} (`{ACTIVE_MODEL_ID}`)"
+    )
 
     with gr.Row():
         with gr.Column(scale=1):

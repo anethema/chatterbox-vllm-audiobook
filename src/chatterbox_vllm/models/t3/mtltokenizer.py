@@ -213,8 +213,17 @@ class MTLTokenizer(PreTrainedTokenizer):
             pretrained_model_name_or_path: Path to the tokenizer file or model name
             **kwargs: Additional arguments to pass to the tokenizer
         """
-        # Load relative to the current file path
-        vocab_file = os.path.join(os.path.dirname(__file__), "grapheme_mtl_merged_expanded_v1.json")
+        # Prefer the tokenizer downloaded alongside the selected multilingual
+        # checkpoint. The packaged file remains as a backward-compatible
+        # fallback for callers that construct this tokenizer directly.
+        vocab_file = os.environ.get("CHATTERBOX_MTL_TOKENIZER_FILE")
+        if not vocab_file:
+            vocab_file = os.path.join(
+                os.path.dirname(__file__),
+                "grapheme_mtl_merged_expanded_v1.json",
+            )
+        if not os.path.isfile(vocab_file):
+            raise FileNotFoundError(f"Multilingual tokenizer is missing: {vocab_file}")
         return cls(vocab_file_path=vocab_file, **kwargs)
 
     def check_vocabset_sot_eot(self):
@@ -244,7 +253,18 @@ class MTLTokenizer(PreTrainedTokenizer):
         if text.startswith('<'):
             language_id = text.split('<')[1].split('>')[0]
             text = text.split('>')[1]
-        
+
+        # The vLLM adapter places the text boundary markers in the prompt
+        # string. Preserve them while normalizing the spoken content: changing
+        # `[STOP]` to `[stop]` makes it ordinary grapheme text and can cause the
+        # model to literally say "stop" at the end of an utterance.
+        has_start_token = text.startswith(SOT)
+        has_stop_token = text.endswith(EOT)
+        if has_start_token:
+            text = text[len(SOT):]
+        if has_stop_token:
+            text = text[:-len(EOT)]
+
         text = self.preprocess_text(text, language_id)
         
         # Language-specific text processing
@@ -262,7 +282,11 @@ class MTLTokenizer(PreTrainedTokenizer):
         # Prepend language token again
         if language_id:
             text = f"[{language_id.lower()}]{text}"
-        
+        if has_start_token:
+            text = SOT + text
+        if has_stop_token:
+            text += EOT
+
         text = text.replace(' ', SPACE)
         return self.tokenizer.encode(text).tokens
 

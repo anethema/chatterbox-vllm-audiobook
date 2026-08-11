@@ -15,6 +15,10 @@ from chatterbox_vllm.projects import (
     saved_project_inputs,
     write_project_progress,
 )
+from chatterbox_vllm.model_variants import (
+    ENGLISH_V1_MODEL_ID,
+    MULTILINGUAL_V3_MODEL_ID,
+)
 
 
 def write_wav(path: Path, sample_rate: int = 24000) -> None:
@@ -63,6 +67,17 @@ class ResumeProjectTests(unittest.TestCase):
             choices = incomplete_project_choices(root)
         self.assertEqual(choices[0][1], "Book-incomplete")
 
+    def test_skips_a_project_with_an_unknown_model(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = self.make_project(root)
+            metadata_path = project / "metadata.json"
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata["model_id"] = "future-model"
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+            choices = incomplete_project_choices(root)
+        self.assertEqual(choices, [])
+
     def test_resume_uses_validated_prefix_and_rolls_back_batch(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -105,6 +120,46 @@ class ResumeProjectTests(unittest.TestCase):
         self.assertEqual(plan.durable_chunks, len(self.chunks))
         self.assertEqual(plan.resume_index, len(self.chunks))
         self.assertEqual(plan.chunks[plan.resume_index:], ())
+
+    def test_rejects_switching_models_with_speech_chunks_remaining(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = self.make_project(root)
+            for index in range(4):
+                write_wav(project / "chunks" / f"{index:06d}.wav")
+
+            with self.assertRaisesRegex(
+                ResumeProjectError,
+                "CHATTERBOX_MODEL_VARIANT=english-v1",
+            ):
+                build_resume_plan(
+                    root,
+                    project.name,
+                    self.book,
+                    24000,
+                    expected_model_id=MULTILINGUAL_V3_MODEL_ID,
+                )
+
+    def test_allows_assembly_only_resume_under_a_different_model(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = self.make_project(root)
+            metadata_path = project / "metadata.json"
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata["model_id"] = ENGLISH_V1_MODEL_ID
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+            for index in range(len(self.chunks)):
+                write_wav(project / "chunks" / f"{index:06d}.wav")
+
+            plan = build_resume_plan(
+                root,
+                project.name,
+                self.book,
+                24000,
+                expected_model_id=MULTILINGUAL_V3_MODEL_ID,
+            )
+
+        self.assertEqual(plan.resume_index, len(self.chunks))
 
     def test_rejects_a_different_epub(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -745,7 +745,7 @@ wheels = [
 ]
 
 [[package]]
-name = "chatterbox-vllm"
+name = "chatterbox-vllm-audiobook"
 source = { editable = "." }
 dependencies = [
     { name = "conformer" },
