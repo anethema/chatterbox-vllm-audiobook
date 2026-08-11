@@ -213,8 +213,17 @@ class MTLTokenizer(PreTrainedTokenizer):
             pretrained_model_name_or_path: Path to the tokenizer file or model name
             **kwargs: Additional arguments to pass to the tokenizer
         """
-        # Load relative to the current file path
-        vocab_file = os.path.join(os.path.dirname(__file__), "grapheme_mtl_merged_expanded_v1.json")
+        # Prefer the tokenizer downloaded alongside the selected multilingual
+        # checkpoint. The packaged file remains as a backward-compatible
+        # fallback for callers that construct this tokenizer directly.
+        vocab_file = os.environ.get("CHATTERBOX_MTL_TOKENIZER_FILE")
+        if not vocab_file:
+            vocab_file = os.path.join(
+                os.path.dirname(__file__),
+                "grapheme_mtl_merged_expanded_v1.json",
+            )
+        if not os.path.isfile(vocab_file):
+            raise FileNotFoundError(f"Multilingual tokenizer is missing: {vocab_file}")
         return cls(vocab_file_path=vocab_file, **kwargs)
 
     def check_vocabset_sot_eot(self):

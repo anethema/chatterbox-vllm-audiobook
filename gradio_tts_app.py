@@ -31,6 +31,13 @@ from chatterbox_vllm.m4b import (
     verify_m4b,
 )
 from chatterbox_vllm.memory import read_memory_status, release_unused_memory
+from chatterbox_vllm.model_variants import (
+    DEFAULT_MODEL_ID,
+    ENGLISH_V1_MODEL_ID,
+    MULTILINGUAL_V3_MODEL_ID,
+    model_label,
+    resolve_model_id,
+)
 from chatterbox_vllm.projects import (
     ResumeProjectError,
     build_resume_plan,
@@ -38,15 +45,21 @@ from chatterbox_vllm.projects import (
     incomplete_project_choices,
     load_project_metadata,
     persist_project_inputs,
+    project_model_id,
     saved_project_inputs,
     write_project_progress,
 )
 from chatterbox_vllm.progress import GenerationControl, estimate_progress, format_duration
 from chatterbox_vllm.tts import ChatterboxTTS
+from chatterbox_vllm.ab_samples import AB_SAMPLE_PROMPTS
 
 
 DEVICE = "cuda"
 OUTPUT_ROOT = Path(__file__).resolve().parent / "audiobook_outputs"
+AB_SAMPLE_ROOT = OUTPUT_ROOT / "_v3_ab_samples"
+ACTIVE_MODEL_ID = resolve_model_id(
+    os.environ.get("CHATTERBOX_MODEL_VARIANT", DEFAULT_MODEL_ID)
+)
 AUDIO_WORKERS = min(4, os.cpu_count() or 1)
 MAX_PENDING_AUDIO_TASKS = AUDIO_WORKERS * 16
 MEMORY_CLEANUP_BATCHES = 64
@@ -56,6 +69,11 @@ MINIMUM_MEMORY_HEADROOM = 2 * 1024 ** 3
 config_seed = None
 global_model = None
 generation_control = GenerationControl()
+
+
+def ab_sample_value(model_id: str, sample_name: str) -> str | None:
+    path = AB_SAMPLE_ROOT / f"{model_id}-{sample_name}.wav"
+    return str(path) if path.is_file() else None
 
 
 class GenerationStopped(Exception):
@@ -85,9 +103,10 @@ def selected_seed(seed_num) -> int | None:
 
 
 def load_model():
-    print("Loading model...")
+    print(f"Loading {model_label(ACTIVE_MODEL_ID)} ({ACTIVE_MODEL_ID})...")
     global global_model
-    global_model = ChatterboxTTS.from_pretrained(
+    global_model = ChatterboxTTS.from_model_id(
+        ACTIVE_MODEL_ID,
         gpu_memory_utilization=0.6,
         max_model_len=1000,
 
@@ -247,7 +266,8 @@ def _save_and_normalize_chunk(
 
 
 def _write_metadata(path: Path, book: EpubBook, source_path: str, chunks: list[TextChunk],
-                    settings: dict, completed: int, output_path: str | None = None,
+                    settings: dict, completed: int, model_id: str,
+                    output_path: str | None = None,
                     scheduled: int | None = None,
                     chunks_available: bool = True):
     saved_epub, saved_reference = saved_project_inputs(path.parent)
@@ -259,6 +279,7 @@ def _write_metadata(path: Path, book: EpubBook, source_path: str, chunks: list[T
         "description": book.description,
         "date": book.date,
         "identifier": book.identifier,
+        "model_id": resolve_model_id(model_id),
         "source_epub": Path(source_path).name,
         "project_epub_file": (
             saved_epub.relative_to(path.parent).as_posix() if saved_epub else None
@@ -357,6 +378,7 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperat
     durable_chunks = 0
     durable_indices = set()
     audio_tasks = None
+    active_project_model_id = global_model.model_id
     generation_control.begin()
     try:
         book = load_epub(epub_path)
@@ -364,10 +386,12 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperat
         if resuming:
             resume_plan = build_resume_plan(
                 OUTPUT_ROOT, resume_project_name, book, global_model.sr,
+                expected_model_id=global_model.model_id,
             )
             project_dir = resume_plan.project_dir
             chunks = list(resume_plan.chunks)
             settings = dict(resume_plan.metadata["settings"])
+            active_project_model_id = project_model_id(resume_plan.metadata)
             source_epub_name = resume_plan.metadata.get(
                 "source_epub", source_epub_name,
             )
@@ -416,7 +440,8 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperat
         metadata_path = project_dir / "metadata.json"
         _write_metadata(
             metadata_path, book, source_epub_name, chunks, settings,
-            durable_chunks, scheduled=durable_chunks,
+            durable_chunks, active_project_model_id,
+            scheduled=durable_chunks,
         )
         write_project_progress(project_dir, durable_chunks, durable_chunks)
 
@@ -521,7 +546,7 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperat
             audio_tasks = None
         _write_metadata(
             metadata_path, book, source_epub_name, chunks, settings,
-            len(chunks), scheduled=len(chunks),
+            len(chunks), active_project_model_id, scheduled=len(chunks),
         )
         write_project_progress(project_dir, len(chunks), len(chunks))
         progress(0.98, desc="Preparing parallel M4B encoding")
@@ -562,6 +587,7 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperat
             chunks,
             settings,
             len(chunks),
+            active_project_model_id,
             relative_output,
             chunks_available=False,
         )
@@ -618,7 +644,11 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperat
 
 
 with gr.Blocks(title="Chatterbox vLLM Audiobook") as demo:
-    gr.Markdown("# Chatterbox vLLM\nQuick voice tests and batched EPUB audiobook generation.")
+    gr.Markdown(
+        "# Chatterbox vLLM\n"
+        "Quick voice tests and batched EPUB audiobook generation.  \n"
+        f"**Active model:** {model_label(ACTIVE_MODEL_ID)} (`{ACTIVE_MODEL_ID}`)"
+    )
 
     with gr.Row():
         with gr.Column(scale=1):
@@ -706,6 +736,29 @@ with gr.Blocks(title="Chatterbox vLLM Audiobook") as demo:
                 )
                 run_btn = gr.Button("Generate Sample", variant="primary")
                 audio_output = gr.Audio(label="Output Audio")
+
+    with gr.Accordion("Temporary V3 A/B listening samples", open=True):
+        gr.Markdown(
+            "These samples use the same Jessica reference, prompt, seed, and "
+            "generation settings. **A** is the original English model and **B** "
+            "is Multilingual V3 in English mode. Both are normalized to -18 LUFS."
+        )
+        for sample_number, (sample_name, sample_text) in enumerate(
+            AB_SAMPLE_PROMPTS,
+            start=1,
+        ):
+            gr.Markdown(f"**Sample {sample_number}:** {sample_text}")
+            with gr.Row():
+                gr.Audio(
+                    value=ab_sample_value(ENGLISH_V1_MODEL_ID, sample_name),
+                    label="A — Original English",
+                    interactive=False,
+                )
+                gr.Audio(
+                    value=ab_sample_value(MULTILINGUAL_V3_MODEL_ID, sample_name),
+                    label="B — Multilingual V3 (English)",
+                    interactive=False,
+                )
 
     run_btn.click(
         fn=generate_sample,

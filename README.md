@@ -96,7 +96,17 @@ uv sync --python 3.12 --torch-backend=auto
 ./run_chatterbox_vllm.sh
 ```
 
-Open <http://127.0.0.1:7860> in a browser. The first launch downloads the Chatterbox model weights from the Hugging Face Hub and will take longer than subsequent launches. Finished audiobooks are saved below `audiobook_outputs/` in the cloned repository.
+Open <http://127.0.0.1:7860> in a browser. The audiobook interface defaults to Chatterbox Multilingual V3 in English mode. The first launch downloads its pinned 2.14 GB T3 checkpoint and the shared Chatterbox components from the Hugging Face Hub, so it takes longer than subsequent launches. Finished audiobooks are saved below `audiobook_outputs/` in the cloned repository.
+
+The previous model paths remain available for comparison and for resuming older projects:
+
+```bash
+CHATTERBOX_MODEL_VARIANT=english-v1 ./run_chatterbox_vllm.sh
+CHATTERBOX_MODEL_VARIANT=multilingual-v2 ./run_chatterbox_vllm.sh
+CHATTERBOX_MODEL_VARIANT=multilingual-v3 ./run_chatterbox_vllm.sh
+```
+
+New project metadata records the selected model. A partial project must resume with the same model so chapters cannot silently mix model versions. If every WAV is already complete, assembly-only resume remains available under any selected model.
 
 The launcher listens on `0.0.0.0:7860` so another computer on the same network can use `http://LINUX_MACHINE_IP:7860`. Only expose that port to networks you trust. To request a temporary public Gradio link, launch with:
 
