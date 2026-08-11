@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import unittest
 import wave
@@ -72,6 +73,25 @@ class ResumeProjectTests(unittest.TestCase):
             plan = build_resume_plan(root, project.name, self.book, 24000)
         self.assertEqual(plan.durable_chunks, 6)
         self.assertEqual(plan.resume_index, 4)
+
+    def test_resume_ignores_and_removes_temp_older_than_rebuilt_final(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = self.make_project(root)
+            chunks_dir = project / "chunks"
+            for index in range(len(self.chunks)):
+                write_wav(chunks_dir / f"{index:06d}.wav")
+            stale_temp = chunks_dir / ".000006.normalized-deadbeef.wav"
+            write_wav(stale_temp)
+            final_path = chunks_dir / "000006.wav"
+            write_wav(final_path)
+            os.utime(stale_temp, ns=(1_000_000_000, 1_000_000_000))
+            os.utime(final_path, ns=(2_000_000_000, 2_000_000_000))
+
+            plan = build_resume_plan(root, project.name, self.book, 24000)
+            self.assertEqual(plan.durable_chunks, len(self.chunks))
+            self.assertEqual(plan.resume_index, len(self.chunks))
+            self.assertFalse(stale_temp.exists())
 
     def test_rejects_a_different_epub(self):
         with tempfile.TemporaryDirectory() as directory:

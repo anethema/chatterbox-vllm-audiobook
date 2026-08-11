@@ -179,7 +179,12 @@ def contiguous_chunk_count(
     total_chunks: int,
     sample_rate: int,
 ) -> int:
-    """Return the durable WAV prefix, stopping before interrupted temp output."""
+    """Return the durable WAV prefix, stopping before interrupted temp output.
+
+    A normalization temp file newer than its final WAV means the process may
+    have died before the atomic replacement. An older temp file is debris from
+    an earlier interruption whose final WAV has since been regenerated.
+    """
 
     directory = Path(chunks_dir)
     durable = 0
@@ -191,8 +196,20 @@ def contiguous_chunk_count(
     temp_pattern = re.compile(r"^\.(\d{6})\.normalized-[^.]+\.wav$")
     for path in directory.glob(".*.normalized-*.wav"):
         match = temp_pattern.match(path.name)
-        if match:
-            durable = min(durable, int(match.group(1)))
+        if not match:
+            continue
+        index = int(match.group(1))
+        final_path = directory / f"{index:06d}.wav"
+        try:
+            temp_mtime = path.stat().st_mtime_ns
+            final_mtime = final_path.stat().st_mtime_ns
+        except OSError:
+            durable = min(durable, index)
+            continue
+        if final_mtime > temp_mtime and _valid_wav(final_path, sample_rate):
+            path.unlink(missing_ok=True)
+            continue
+        durable = min(durable, index)
     return durable
 
 
