@@ -5,12 +5,10 @@ from pathlib import Path
 import random
 import re
 import shutil
-import subprocess
 import tempfile
 import time
 import traceback
 from uuid import uuid4
-import wave
 
 import gradio as gr
 import numpy as np
@@ -26,8 +24,9 @@ from chatterbox_vllm.audio import (
 from chatterbox_vllm.background import BackgroundTaskPool
 from chatterbox_vllm.epub import EpubBook, EpubError, TextChunk, chunk_book, load_epub
 from chatterbox_vllm.m4b import (
-    ChapterMarker,
-    build_ffmetadata,
+    AssemblyProgress,
+    AssemblyStopped,
+    assemble_audiobook,
     delete_intermediate_chunks,
     verify_m4b,
 )
@@ -164,7 +163,10 @@ def inspect_epub_file(epub_path, max_chars):
 def request_generation_stop():
     if not generation_control.request_stop():
         return "No EPUB generation is currently running."
-    return "⏹️ Stop requested. The current vLLM batch will finish, then generation will stop."
+    return (
+        "⏹️ Stop requested. The current vLLM batch will finish, or active M4B "
+        "encoding processes will be stopped."
+    )
 
 
 def refresh_resume_projects():
@@ -325,109 +327,6 @@ def _protect_system_memory(batch_number: int) -> None:
             "System memory is critically low. Generation paused before Linux could "
             "kill the process; restart the app and resume this project"
         )
-
-
-def _write_silence(path: Path, sample_rate: int, duration: float):
-    samples = torch.zeros((1, max(1, int(sample_rate * duration))), dtype=torch.float32)
-    ta.save(str(path), samples, sample_rate, encoding="PCM_S", bits_per_sample=16)
-
-
-def _wav_duration_ms(path: Path) -> int:
-    with wave.open(str(path), "rb") as audio:
-        return round(audio.getnframes() * 1000 / audio.getframerate())
-
-
-def _cover_suffix(media_type: str) -> str:
-    return {
-        "image/jpeg": ".jpg",
-        "image/jpg": ".jpg",
-        "image/png": ".png",
-    }.get(media_type.lower(), "")
-
-
-def _assemble_audiobook(
-    project_dir: Path,
-    book: EpubBook,
-    chunks: list[TextChunk],
-    sample_rate: int,
-) -> Path:
-    ffmpeg = shutil.which("ffmpeg")
-    if not ffmpeg:
-        raise RuntimeError("FFmpeg is required to assemble the audiobook M4B")
-
-    short_pause = project_dir / "pause-between-chunks.wav"
-    chapter_pause = project_dir / "pause-between-chapters.wav"
-    _write_silence(short_pause, sample_rate, 0.18)
-    _write_silence(chapter_pause, sample_rate, 0.9)
-
-    concat_path = project_dir / "concat.txt"
-    entries: list[Path] = []
-    chapter_starts: list[tuple[str, int]] = []
-    timeline_ms = 0
-    for index, chunk in enumerate(chunks):
-        chapter_changed = index == 0 or chunk.chapter_index != chunks[index - 1].chapter_index
-        if chapter_changed:
-            chapter_starts.append((chunk.chapter_title, timeline_ms))
-        if index:
-            previous = chunks[index - 1]
-            pause = chapter_pause if chunk.chapter_index != previous.chapter_index else short_pause
-            entries.append(pause)
-            timeline_ms += _wav_duration_ms(pause)
-        chunk_path = project_dir / "chunks" / f"{index:06d}.wav"
-        entries.append(chunk_path)
-        timeline_ms += _wav_duration_ms(chunk_path)
-    concat_path.write_text(
-        "".join(f"file '{entry.as_posix()}'\n" for entry in entries),
-        encoding="utf-8",
-    )
-
-    markers = [
-        ChapterMarker(
-            title,
-            start,
-            chapter_starts[index + 1][1] if index + 1 < len(chapter_starts) else timeline_ms,
-        )
-        for index, (title, start) in enumerate(chapter_starts)
-    ]
-    ffmetadata_path = project_dir / "audiobook.ffmetadata"
-    ffmetadata_path.write_text(build_ffmetadata(book, markers), encoding="utf-8")
-
-    cover_path = None
-    cover_suffix = _cover_suffix(book.cover_media_type)
-    if book.cover_image and cover_suffix:
-        cover_path = project_dir / f"cover{cover_suffix}"
-        cover_path.write_bytes(book.cover_image)
-
-    output_path = project_dir / "audiobook.m4b"
-    command = [
-        ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
-        "-f", "concat", "-safe", "0", "-i", str(concat_path),
-        "-f", "ffmetadata", "-i", str(ffmetadata_path),
-    ]
-    if cover_path:
-        command.extend(["-i", str(cover_path)])
-    command.extend(["-map", "0:a", "-map_metadata", "1", "-map_chapters", "1"])
-    if cover_path:
-        command.extend(
-            [
-                "-map", "2:v:0", "-c:v", "copy", "-disposition:v:0", "attached_pic",
-                "-metadata:s:v:0", "title=Cover",
-            ]
-        )
-    command.extend(
-        [
-            "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart",
-            "-f", "mp4", str(output_path),
-        ]
-    )
-    result = subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"FFmpeg failed to assemble the M4B: {result.stderr.strip()}")
-    return output_path
 
 
 def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperature,
@@ -621,10 +520,35 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperat
             len(chunks), scheduled=len(chunks),
         )
         write_project_progress(project_dir, len(chunks), len(chunks))
-        progress(0.98, desc="Assembling chaptered M4B")
-        output_path = _assemble_audiobook(project_dir, book, chunks, global_model.sr)
-        progress(0.99, desc="Verifying completed M4B")
-        verify_m4b(output_path)
+        progress(0.98, desc="Preparing parallel M4B encoding")
+
+        def report_assembly(update: AssemblyProgress) -> None:
+            if update.phase == "encoding":
+                position = 0.98 + 0.015 * update.fraction
+                operation = f"Encoding M4B with {update.workers} workers"
+            else:
+                position = 0.995 + 0.004 * update.fraction
+                operation = "Finalizing M4B"
+            progress(
+                min(0.999, position),
+                desc=(
+                    f"{operation}: {update.fraction:.1%} • "
+                    f"{update.realtime_speed:.2f}× realtime • "
+                    f"ETA {format_duration(update.eta_seconds)}"
+                ),
+            )
+
+        output_path = assemble_audiobook(
+            project_dir,
+            book,
+            chunks,
+            global_model.sr,
+            stop_requested=generation_control.stop_requested,
+            progress_callback=report_assembly,
+            ffmpeg=ffmpeg,
+        )
+        progress(0.999, desc="Verifying completed M4B")
+        final_audio_seconds = verify_m4b(output_path)
         delete_intermediate_chunks(project_dir)
         relative_output = output_path.relative_to(Path(__file__).resolve().parent).as_posix()
         _write_metadata(
@@ -639,16 +563,16 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperat
         )
         (project_dir / "progress.json").unlink(missing_ok=True)
         generation_elapsed = time.perf_counter() - generation_started
-        final_speed = generated_audio_seconds / max(generation_elapsed, 1e-9)
+        final_speed = final_audio_seconds / max(generation_elapsed, 1e-9)
         progress(1, desc="Audiobook complete")
         return str(output_path), (
             f"✅ **{book.title}** complete: {len(book.chapters)} chapters and "
             f"{len(chunks):,} speech chunks. Generated "
-            f"{format_duration(generated_audio_seconds)} of audio in "
+            f"{format_duration(final_audio_seconds)} of audio in "
             f"{format_duration(generation_elapsed)} ({final_speed:.2f}× realtime). "
             f"Files were saved under `{project_dir}` and intermediate chunks were removed."
         )
-    except GenerationStopped:
+    except (GenerationStopped, AssemblyStopped):
         if audio_tasks is not None:
             audio_tasks.cancel_and_wait()
             audio_tasks = None
