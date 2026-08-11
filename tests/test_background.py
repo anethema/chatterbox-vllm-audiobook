@@ -57,6 +57,14 @@ class BackgroundTaskPoolTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "max_pending"):
             BackgroundTaskPool(max_workers=2, max_pending=1)
 
+    def test_completed_results_can_be_drained(self):
+        pool = BackgroundTaskPool(max_workers=1, max_pending=1)
+        pool.submit(lambda: "first")
+        pool.submit(lambda: "second")
+        self.assertEqual(pool.take_results(), ["first"])
+        pool.finish()
+        self.assertEqual(pool.take_results(), ["second"])
+
 
 if __name__ == "__main__":
     unittest.main()

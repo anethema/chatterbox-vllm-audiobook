@@ -128,6 +128,12 @@ class ChatterboxTTS:
             "task": "generate",
             "tokenizer": "EnTokenizer" if variant == "english" else "MtlTokenizer",
             "tokenizer_mode": "custom",
+            # Chatterbox sends its voice conditionals through vLLM's multimodal
+            # path. vLLM 0.10 mirrors a 4 GiB preprocessing cache in the frontend
+            # and worker processes; long books can fill both caches and exhaust a
+            # default 16 GiB WSL VM. The conditionals are already computed and
+            # reused here, so that cache only adds memory pressure.
+            "disable_mm_preprocessor_cache": True,
             "gpu_memory_utilization": vllm_memory_percent,
             "enforce_eager": not compile,
             "max_model_len": max_model_len,
