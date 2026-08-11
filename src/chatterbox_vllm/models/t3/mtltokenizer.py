@@ -253,7 +253,18 @@ class MTLTokenizer(PreTrainedTokenizer):
         if text.startswith('<'):
             language_id = text.split('<')[1].split('>')[0]
             text = text.split('>')[1]
-        
+
+        # The vLLM adapter places the text boundary markers in the prompt
+        # string. Preserve them while normalizing the spoken content: changing
+        # `[STOP]` to `[stop]` makes it ordinary grapheme text and can cause the
+        # model to literally say "stop" at the end of an utterance.
+        has_start_token = text.startswith(SOT)
+        has_stop_token = text.endswith(EOT)
+        if has_start_token:
+            text = text[len(SOT):]
+        if has_stop_token:
+            text = text[:-len(EOT)]
+
         text = self.preprocess_text(text, language_id)
         
         # Language-specific text processing
@@ -271,7 +282,11 @@ class MTLTokenizer(PreTrainedTokenizer):
         # Prepend language token again
         if language_id:
             text = f"[{language_id.lower()}]{text}"
-        
+        if has_start_token:
+            text = SOT + text
+        if has_stop_token:
+            text += EOT
+
         text = text.replace(' ', SPACE)
         return self.tokenizer.encode(text).tokens
 
