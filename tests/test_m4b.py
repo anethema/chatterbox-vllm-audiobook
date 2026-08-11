@@ -17,6 +17,7 @@ from chatterbox_vllm.m4b import (
     build_ffmetadata,
     default_m4b_workers,
     delete_intermediate_chunks,
+    physical_core_cpu_ids,
     plan_encoding_segments,
     verify_m4b,
 )
@@ -165,6 +166,22 @@ class M4BTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(default_m4b_workers(cpu_count=32), 16)
             self.assertEqual(default_m4b_workers(cpu_count=4), 2)
+
+    def test_selects_one_allowed_logical_cpu_per_physical_core(self):
+        with tempfile.TemporaryDirectory() as directory:
+            topology_root = Path(directory)
+            for cpu, core in ((0, 0), (1, 0), (2, 1), (3, 1), (4, 2), (5, 2)):
+                topology = topology_root / f"cpu{cpu}" / "topology"
+                topology.mkdir(parents=True)
+                (topology / "physical_package_id").write_text("0")
+                (topology / "core_id").write_text(str(core))
+
+            selected = physical_core_cpu_ids(
+                available_cpu_ids=(1, 2, 3, 4, 5),
+                topology_root=topology_root,
+            )
+
+        self.assertEqual(selected, (1, 2, 4))
 
     @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "FFmpeg required")
     def test_parallel_assembly_creates_verified_chaptered_m4b(self):

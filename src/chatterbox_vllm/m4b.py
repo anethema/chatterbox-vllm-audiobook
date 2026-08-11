@@ -211,8 +211,44 @@ def default_m4b_workers(cpu_count: int | None = None) -> int:
         if workers < 1:
             raise RuntimeError("CHATTERBOX_M4B_WORKERS must be at least 1")
         return workers
-    available = os.cpu_count() if cpu_count is None else cpu_count
-    return min(16, max(1, (available or 2) // 2))
+    if cpu_count is not None:
+        return max(1, cpu_count // 2)
+    return max(1, len(physical_core_cpu_ids()))
+
+
+def physical_core_cpu_ids(
+    *,
+    available_cpu_ids: Sequence[int] | None = None,
+    topology_root: str | Path = "/sys/devices/system/cpu",
+) -> tuple[int, ...]:
+    """Choose one allowed logical CPU from each physical core."""
+
+    if available_cpu_ids is None:
+        try:
+            available = sorted(os.sched_getaffinity(0))
+        except (AttributeError, OSError):
+            available = list(range(os.cpu_count() or 1))
+    else:
+        available = sorted(set(int(cpu) for cpu in available_cpu_ids))
+    if not available:
+        return (0,)
+
+    root = Path(topology_root)
+    cores: dict[tuple[int, int], int] = {}
+    for cpu in available:
+        topology = root / f"cpu{cpu}" / "topology"
+        try:
+            package_id = int((topology / "physical_package_id").read_text().strip())
+            core_id = int((topology / "core_id").read_text().strip())
+        except (OSError, ValueError):
+            continue
+        cores.setdefault((package_id, core_id), cpu)
+    if cores:
+        return tuple(sorted(cores.values()))
+
+    # Linux normally exposes the topology files above. If a container hides
+    # them, adjacent logical IDs are the safest available SMT-pair fallback.
+    return tuple(available[::2]) or (available[0],)
 
 
 def _wav_duration_ms(path: Path) -> int:
@@ -398,6 +434,7 @@ def _run_parallel_encoders(
     ffmpeg: str,
     assembly_dir: Path,
     segments: Sequence[EncodingSegment],
+    cpu_ids: Sequence[int],
     stop_requested: Callable[[], bool],
     progress_callback: Callable[[AssemblyProgress], None] | None,
 ) -> list[Path]:
@@ -405,6 +442,7 @@ def _run_parallel_encoders(
     outputs: list[Path] = []
     total_seconds = sum(segment.duration_ms for segment in segments) / 1000
     started = time.monotonic()
+    taskset = shutil.which("taskset")
     try:
         for segment in segments:
             concat_path = assembly_dir / f"segment-{segment.index:03d}.concat.txt"
@@ -414,35 +452,47 @@ def _run_parallel_encoders(
             _write_concat(concat_path, segment.entries)
             progress_handle = progress_path.open("wb")
             error_handle = error_path.open("wb")
+            cpu_id = cpu_ids[segment.index % len(cpu_ids)]
+            command = [
+                ffmpeg,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(concat_path),
+                "-vn",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "96k",
+                "-progress",
+                "pipe:1",
+                "-nostats",
+                "-f",
+                "mp4",
+                str(output_path),
+            ]
+            if taskset:
+                command = [taskset, "--cpu-list", str(cpu_id), *command]
             try:
                 process = subprocess.Popen(
-                    [
-                        ffmpeg,
-                        "-hide_banner",
-                        "-loglevel",
-                        "error",
-                        "-y",
-                        "-f",
-                        "concat",
-                        "-safe",
-                        "0",
-                        "-i",
-                        str(concat_path),
-                        "-vn",
-                        "-c:a",
-                        "aac",
-                        "-b:a",
-                        "96k",
-                        "-progress",
-                        "pipe:1",
-                        "-nostats",
-                        "-f",
-                        "mp4",
-                        str(output_path),
-                    ],
+                    command,
                     stdout=progress_handle,
                     stderr=error_handle,
                 )
+                if not taskset:
+                    try:
+                        os.sched_setaffinity(process.pid, {cpu_id})
+                    except (AttributeError, OSError) as error:
+                        print(
+                            f"[M4B] Could not pin encoder {segment.index + 1} "
+                            f"to CPU {cpu_id}: {error}"
+                        )
             except Exception:
                 progress_handle.close()
                 error_handle.close()
@@ -591,8 +641,12 @@ def assemble_audiobook(
         entries, markers, timeline_ms = build_audio_timeline(
             project, assembly_dir, chunks, sample_rate,
         )
-        segment_plan = plan_encoding_segments(
-            entries, workers if workers is not None else default_m4b_workers(),
+        physical_cpus = physical_core_cpu_ids()
+        worker_count = workers if workers is not None else default_m4b_workers()
+        segment_plan = plan_encoding_segments(entries, worker_count)
+        print(
+            f"[M4B] Encoding with {len(segment_plan)} workers pinned to logical CPUs "
+            f"{list(physical_cpus[:len(segment_plan)])} (one per physical core)"
         )
         metadata_path = project / "audiobook.ffmetadata"
         metadata_path.write_text(build_ffmetadata(book, markers), encoding="utf-8")
@@ -607,6 +661,7 @@ def assemble_audiobook(
             ffmpeg,
             assembly_dir,
             segment_plan,
+            physical_cpus,
             stop_requested,
             progress_callback,
         )
