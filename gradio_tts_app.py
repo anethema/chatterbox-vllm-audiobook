@@ -33,8 +33,6 @@ from chatterbox_vllm.m4b import (
 from chatterbox_vllm.memory import read_memory_status, release_unused_memory
 from chatterbox_vllm.model_variants import (
     DEFAULT_MODEL_ID,
-    ENGLISH_V1_MODEL_ID,
-    MULTILINGUAL_V3_MODEL_ID,
     model_label,
     resolve_model_id,
 )
@@ -51,12 +49,10 @@ from chatterbox_vllm.projects import (
 )
 from chatterbox_vllm.progress import GenerationControl, estimate_progress, format_duration
 from chatterbox_vllm.tts import ChatterboxTTS
-from chatterbox_vllm.ab_samples import AB_SAMPLE_PROMPTS
 
 
 DEVICE = "cuda"
 OUTPUT_ROOT = Path(__file__).resolve().parent / "audiobook_outputs"
-AB_SAMPLE_ROOT = OUTPUT_ROOT / "_v3_ab_samples"
 ACTIVE_MODEL_ID = resolve_model_id(
     os.environ.get("CHATTERBOX_MODEL_VARIANT", DEFAULT_MODEL_ID)
 )
@@ -69,11 +65,6 @@ MINIMUM_MEMORY_HEADROOM = 2 * 1024 ** 3
 config_seed = None
 global_model = None
 generation_control = GenerationControl()
-
-
-def ab_sample_value(model_id: str, sample_name: str) -> str | None:
-    path = AB_SAMPLE_ROOT / f"{model_id}-{sample_name}.wav"
-    return str(path) if path.is_file() else None
 
 
 class GenerationStopped(Exception):
@@ -736,29 +727,6 @@ with gr.Blocks(title="Chatterbox vLLM Audiobook") as demo:
                 )
                 run_btn = gr.Button("Generate Sample", variant="primary")
                 audio_output = gr.Audio(label="Output Audio")
-
-    with gr.Accordion("Temporary V3 A/B listening samples", open=True):
-        gr.Markdown(
-            "These samples use the same Jessica reference, prompt, seed, and "
-            "generation settings. **A** is the original English model and **B** "
-            "is Multilingual V3 in English mode. Both are normalized to -18 LUFS."
-        )
-        for sample_number, (sample_name, sample_text) in enumerate(
-            AB_SAMPLE_PROMPTS,
-            start=1,
-        ):
-            gr.Markdown(f"**Sample {sample_number}:** {sample_text}")
-            with gr.Row():
-                gr.Audio(
-                    value=ab_sample_value(ENGLISH_V1_MODEL_ID, sample_name),
-                    label="A — Original English",
-                    interactive=False,
-                )
-                gr.Audio(
-                    value=ab_sample_value(MULTILINGUAL_V3_MODEL_ID, sample_name),
-                    label="B — Multilingual V3 (English)",
-                    interactive=False,
-                )
 
     run_btn.click(
         fn=generate_sample,
