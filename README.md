@@ -178,7 +178,7 @@ audiobook_outputs/Book-YYYYMMDD-HHMMSS-ID/
 
 The finished M4B contains AAC audio, chapter markers, and available EPUB title, author, cover, language, publisher, description, date, and identifier metadata.
 
-After assembly, the app uses FFprobe to verify that the M4B contains readable AAC audio with a positive duration. Only after verification succeeds are <code>chunks/</code> and <code>progress.json</code> removed. The saved EPUB, reference voice, metadata, and final M4B remain.
+After assembly, the app uses FFprobe to verify that the M4B contains readable AAC audio with a positive duration. Only after verification succeeds are <code>chunks/</code> and <code>progress.json</code> removed. The saved EPUB, reference voice, metadata, and final M4B remain. The web interface serves the verified M4B directly from this folder instead of duplicating large audiobooks in temporary storage.
 
 ## Stopping and resuming
 

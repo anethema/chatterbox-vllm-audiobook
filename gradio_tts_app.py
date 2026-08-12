@@ -24,6 +24,7 @@ from chatterbox_vllm.audio import (
     normalize_speech_wav,
 )
 from chatterbox_vllm.background import BackgroundTaskPool
+from chatterbox_vllm.downloads import register_completed_audiobook
 from chatterbox_vllm.epub import EpubBook, EpubError, TextChunk, chunk_book, load_epub
 from chatterbox_vllm.m4b import (
     AssemblyProgress,
@@ -633,6 +634,11 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperat
         generation_elapsed = time.perf_counter() - generation_started
         final_speed = final_audio_seconds / max(generation_elapsed, 1e-9)
         progress(1, desc="Audiobook complete")
+        output_path = register_completed_audiobook(
+            output_path,
+            OUTPUT_ROOT,
+            gr.set_static_paths,
+        )
         return str(output_path), (
             f"✅ **{book.title}** complete: {len(book.chapters)} chapters and "
             f"{len(chunks):,} speech chunks. Generated "
