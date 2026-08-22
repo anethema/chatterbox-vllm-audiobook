@@ -111,10 +111,11 @@ def load_model():
     return global_model
 
 
-def generation_arguments(exaggeration, temperature, diffusion_steps, min_p,
-                         top_p, repetition_penalty, seed):
+def generation_arguments(exaggeration, cfg_weight, temperature, diffusion_steps,
+                         min_p, top_p, repetition_penalty, seed):
     return {
         "exaggeration": float(exaggeration),
+        "cfg_weight": float(cfg_weight),
         "temperature": float(temperature),
         "diffusion_steps": int(diffusion_steps),
         "min_p": float(min_p),
@@ -124,14 +125,15 @@ def generation_arguments(exaggeration, temperature, diffusion_steps, min_p,
     }
 
 
-def generate_sample(text, audio_prompt_path, exaggeration, temperature, seed_num,
-                    diffusion_steps, min_p, top_p, repetition_penalty):
+def generate_sample(text, audio_prompt_path, exaggeration, cfg_weight, temperature,
+                    seed_num, diffusion_steps, min_p, top_p,
+                    repetition_penalty):
     if not text or not text.strip():
         raise gr.Error("Enter some text to synthesize.")
 
     seed = selected_seed(seed_num)
     args = generation_arguments(
-        exaggeration, temperature, diffusion_steps, min_p, top_p,
+        exaggeration, cfg_weight, temperature, diffusion_steps, min_p, top_p,
         repetition_penalty, seed,
     )
     print(f"Using text: {text}")
@@ -355,9 +357,9 @@ def _protect_system_memory(batch_number: int) -> None:
         )
 
 
-def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperature,
-                            seed_num, diffusion_steps, min_p, top_p,
-                            repetition_penalty, max_chars, batch_size,
+def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weight,
+                            temperature, seed_num, diffusion_steps, min_p,
+                            top_p, repetition_penalty, max_chars, batch_size,
                             resume_project_name,
                             progress=gr.Progress()):
     resuming = bool(resume_project_name)
@@ -416,7 +418,8 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, temperat
                 raise EpubError("EPUB did not produce any speech chunks")
             seed = selected_seed(seed_num)
             settings = generation_arguments(
-                exaggeration, temperature, diffusion_steps, min_p, top_p,
+                exaggeration, cfg_weight, temperature, diffusion_steps, min_p,
+                top_p,
                 repetition_penalty, seed,
             )
             settings.update(
@@ -708,6 +711,11 @@ with gr.Blocks(title="Chatterbox vLLM Audiobook") as demo:
                 label="Exaggeration (Neutral = 0.5; extreme values can be unstable)",
                 value=.5,
             )
+            cfg_weight = gr.Slider(
+                0.0, 1.0, step=.05,
+                label="CFG/Pace (lower = looser and often slower; neutral = 0.5)",
+                value=.5,
+            )
             with gr.Accordion("More options", open=False):
                 seed_num = gr.Number(value=0, label="Random seed (0 for random)")
                 diffusion_steps = gr.Slider(
@@ -784,8 +792,8 @@ with gr.Blocks(title="Chatterbox vLLM Audiobook") as demo:
     run_btn.click(
         fn=generate_sample,
         inputs=[
-            text, ref_wav, exaggeration, temp, seed_num, diffusion_steps,
-            min_p, top_p, repetition_penalty,
+            text, ref_wav, exaggeration, cfg_weight, temp, seed_num,
+            diffusion_steps, min_p, top_p, repetition_penalty,
         ],
         outputs=audio_output,
     )
@@ -802,9 +810,9 @@ with gr.Blocks(title="Chatterbox vLLM Audiobook") as demo:
     epub_generation_event = epub_btn.click(
         fn=generate_epub_audiobook,
         inputs=[
-            epub_file, ref_wav, exaggeration, temp, seed_num, diffusion_steps,
-            min_p, top_p, repetition_penalty, max_chars, batch_size,
-            new_project_state,
+            epub_file, ref_wav, exaggeration, cfg_weight, temp, seed_num,
+            diffusion_steps, min_p, top_p, repetition_penalty, max_chars,
+            batch_size, new_project_state,
         ],
         # Keep the textual result hidden while this event is running. Making a
         # visible Markdown component a live output causes Gradio to render the
@@ -814,9 +822,9 @@ with gr.Blocks(title="Chatterbox vLLM Audiobook") as demo:
     resume_generation_event = resume_epub_btn.click(
         fn=generate_epub_audiobook,
         inputs=[
-            epub_file, ref_wav, exaggeration, temp, seed_num, diffusion_steps,
-            min_p, top_p, repetition_penalty, max_chars, batch_size,
-            resume_project,
+            epub_file, ref_wav, exaggeration, cfg_weight, temp, seed_num,
+            diffusion_steps, min_p, top_p, repetition_penalty, max_chars,
+            batch_size, resume_project,
         ],
         outputs=[epub_audio_output, epub_result_status],
     )

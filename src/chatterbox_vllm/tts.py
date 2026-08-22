@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import threading
 from typing import Optional, Union, Tuple, Any
 import time
 
@@ -30,6 +31,14 @@ from .model_variants import (
 )
 
 REPO_ID = "ResembleAI/chatterbox"
+
+
+class T3WorkerExtension:
+    """Control hooks injected into vLLM's worker class."""
+
+    def set_t3_cfg_scale(self, cfg_scale: float) -> float:
+        return self.model_runner.model.set_cfg_scale(cfg_scale)
+
 
 @dataclass
 class Conditionals:
@@ -86,6 +95,7 @@ class ChatterboxTTS:
         self.default_conds = default_conds
         self.variant = variant
         self.model_id = resolve_model_id(model_id)
+        self._t3_generation_lock = threading.Lock()
 
     @property
     def sr(self) -> int:
@@ -175,6 +185,7 @@ class ChatterboxTTS:
             "gpu_memory_utilization": vllm_memory_percent,
             "enforce_eager": not compile,
             "max_model_len": max_model_len,
+            "worker_extension_cls": "chatterbox_vllm.tts.T3WorkerExtension",
         }
 
         t3 = LLM(**{**base_vllm_kwargs, **kwargs})
@@ -323,6 +334,7 @@ class ChatterboxTTS:
         # From original Chatterbox HF generation args
         top_p=0.8,
         repetition_penalty=1.2,
+        cfg_weight: float | None = None,
 
         # Supports anything in https://docs.vllm.ai/en/v0.9.2/api/vllm/index.html?h=samplingparams#vllm.SamplingParams
         *args, **kwargs,
@@ -339,6 +351,7 @@ class ChatterboxTTS:
             max_tokens=max_tokens,
             top_p=top_p,
             repetition_penalty=repetition_penalty,
+            cfg_weight=cfg_weight,
             *args, **kwargs
         )
 
@@ -361,6 +374,7 @@ class ChatterboxTTS:
         top_p=1.0,
         min_p=0.05,
         repetition_penalty=2.0,
+        cfg_weight: float | None = None,
 
         # Supports anything in https://docs.vllm.ai/en/v0.9.2/api/vllm/index.html?h=samplingparams#vllm.SamplingParams
         *args, **kwargs,
@@ -378,6 +392,13 @@ class ChatterboxTTS:
 
         cond_emb = self.update_exaggeration(cond_emb, exaggeration)
 
+        if cfg_weight is None:
+            cfg_weight = float(os.environ.get("CHATTERBOX_CFG_SCALE", "0.5"))
+        else:
+            cfg_weight = float(cfg_weight)
+        if not 0.0 <= cfg_weight <= 1.0:
+            raise ValueError("cfg_weight must be between 0.0 and 1.0")
+
         # Norm and tokenize text
         prompts = ["[START]" + punc_norm(p) + "[STOP]" for p in prompts]
 
@@ -389,27 +410,31 @@ class ChatterboxTTS:
 
         with torch.inference_mode():
             start_time = time.time()
-            batch_results = self.t3.generate(
-                [
-                    {
-                        "prompt": text,
-                        "multi_modal_data": {
-                            "conditionals": [cond_emb],
-                        },
-                    }
-                    for text in prompts
-                ],
-                sampling_params=SamplingParams(
-                    temperature=temperature,
+            # vLLM's V1 engine passes None as custom-model sampling metadata,
+            # so update the worker model directly. Keep the update and T3 run
+            # atomic because the scale is shared by the worker.
+            with self._t3_generation_lock:
+                self.t3.collective_rpc("set_t3_cfg_scale", args=(cfg_weight,))
+                batch_results = self.t3.generate(
+                    [
+                        {
+                            "prompt": text,
+                            "multi_modal_data": {
+                                "conditionals": [cond_emb],
+                            },
+                        }
+                        for text in prompts
+                    ],
+                    sampling_params=SamplingParams(
+                        temperature=temperature,
 
-                    stop_token_ids=[self.t3_config.stop_speech_token + SPEECH_TOKEN_OFFSET],
-                    max_tokens=min(max_tokens, self.max_model_len),
-                    top_p=top_p,
-                    repetition_penalty=repetition_penalty,
-
-                    *args, **kwargs,
+                        stop_token_ids=[self.t3_config.stop_speech_token + SPEECH_TOKEN_OFFSET],
+                        max_tokens=min(max_tokens, self.max_model_len),
+                        top_p=top_p,
+                        repetition_penalty=repetition_penalty,
+                        *args, **kwargs,
+                    )
                 )
-            )
             t3_gen_time = time.time() - start_time
             print(f"[T3] Speech Token Generation time: {t3_gen_time:.2f}s")
 

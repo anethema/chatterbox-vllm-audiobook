@@ -296,6 +296,13 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
         self.cfg_scale = float(os.environ.get("CHATTERBOX_CFG_SCALE", "0.5"))
         print("Applying CFG scale:", self.cfg_scale)
 
+    def set_cfg_scale(self, cfg_scale: float) -> float:
+        cfg_scale = float(cfg_scale)
+        if not 0.0 <= cfg_scale <= 1.0:
+            raise ValueError("cfg_scale must be between 0.0 and 1.0")
+        self.cfg_scale = cfg_scale
+        return self.cfg_scale
+
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loaded_params: set[str] = set()

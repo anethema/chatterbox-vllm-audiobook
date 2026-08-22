@@ -147,6 +147,7 @@ Current UI defaults:
 | --- | ---: |
 | Model | Multilingual V3, English mode |
 | Exaggeration | 0.5 |
+| CFG/Pace | 0.5 |
 | Diffusion steps | 15 |
 | Temperature | 0.8 |
 | Min-P | 0.05 |
@@ -157,7 +158,7 @@ Current UI defaults:
 | Loudness target | -18 LUFS |
 | V3 maximum internal pause | 500 ms |
 
-Larger batches can improve GPU throughput but increase peak resource use. Diffusion steps primarily trade speed for waveform quality. Extreme sampling or exaggeration settings can reduce stability. V3 pause limiting runs with WAV saving and normalization in the bounded CPU background pool, allowing GPU generation to continue with the next batch.
+Larger batches can improve GPU throughput but increase peak resource use. Diffusion steps primarily trade speed for waveform quality. Lower CFG/Pace values loosen text guidance and often produce slower delivery, while higher exaggeration increases expressiveness and can also increase pace. Extreme sampling or exaggeration settings can reduce stability. New projects save CFG/Pace with their other generation settings so resumed chunks keep the same delivery. V3 pause limiting runs with WAV saving and normalization in the bounded CPU background pool, allowing GPU generation to continue with the next batch.
 
 Opening another browser tab does not load another model copy; every tab uses the same server process and model. Do not start overlapping text and EPUB jobs, because separate Gradio events can contend for the same GPU, CPU, and RAM and may make a long conversion appear stalled.
 
