@@ -58,7 +58,10 @@ def reference_loudness_filter(
             "Reference audio is silent or too quiet for loudness normalization"
         )
     measured = ":".join(f"{key}={value}" for key, value in fields.items())
-    return f"aformat=channel_layouts=mono,{base}:{measured}:linear=true"
+    return (
+        f"aformat=channel_layouts=mono,{base}:{measured}:"
+        "linear=true:print_format=json"
+    )
 
 
 def _parse_loudness_measurements(stderr: str) -> dict[str, str]:
@@ -87,6 +90,7 @@ def normalized_reference_audio(
     if not ffmpeg:
         raise RuntimeError("FFmpeg is required to normalize reference audio")
 
+    print(f"[Reference normalization] Measuring: {source}", flush=True)
     measurement_command = [
         ffmpeg,
         "-nostdin",
@@ -108,6 +112,12 @@ def normalized_reference_audio(
         detail = measured.stderr.strip() or "unknown FFmpeg error"
         raise RuntimeError(f"FFmpeg failed to measure reference audio: {detail}")
     measurements = _parse_loudness_measurements(measured.stderr)
+    print(
+        "[Reference normalization] "
+        f"Input: {measurements['input_i']} LUFS, "
+        f"{measurements['input_tp']} dBTP",
+        flush=True,
+    )
 
     with tempfile.TemporaryDirectory(prefix="chatterbox-reference-") as directory:
         normalized = Path(directory) / "normalized-reference.wav"
@@ -116,7 +126,7 @@ def normalized_reference_audio(
             "-nostdin",
             "-hide_banner",
             "-loglevel",
-            "error",
+            "info",
             "-y",
             "-i",
             str(source),
@@ -140,6 +150,15 @@ def normalized_reference_audio(
             raise RuntimeError(f"FFmpeg failed to normalize reference audio: {detail}")
         if not normalized.is_file() or normalized.stat().st_size == 0:
             raise RuntimeError("FFmpeg did not produce normalized reference audio")
+        output = _parse_loudness_measurements(result.stderr)
+        print(
+            "[Reference normalization] "
+            f"Output: {output.get('output_i', 'unknown')} LUFS, "
+            f"{output.get('output_tp', 'unknown')} dBTP "
+            f"({output.get('normalization_type', 'unknown')}, "
+            f"{int(sample_rate)} Hz mono; source unchanged)",
+            flush=True,
+        )
         yield normalized
 
 

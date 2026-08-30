@@ -115,6 +115,10 @@ def prepare_reference_preview(audio_prompt_path: str | None) -> str | None:
     )
     with normalized_reference_audio(audio_prompt_path, 24000) as normalized:
         shutil.copyfile(normalized, destination)
+    print(
+        f"[Reference normalization] Gradio player now uses: {destination}",
+        flush=True,
+    )
     return str(destination)
 
 

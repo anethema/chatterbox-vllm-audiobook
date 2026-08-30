@@ -102,11 +102,25 @@ class ReferenceAudioNormalizationTests(unittest.TestCase):
                     stderr = "analysis\n" + json.dumps(self.measurements)
                     return subprocess.CompletedProcess(command, 0, "", stderr)
                 Path(command[-1]).write_bytes(b"normalized")
-                return subprocess.CompletedProcess(command, 0, "", "")
+                output = dict(
+                    self.measurements,
+                    output_i="-20.00",
+                    output_tp="-4.13",
+                    normalization_type="linear",
+                )
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    "",
+                    "normalization\n" + json.dumps(output),
+                )
 
-            with patch(
-                "chatterbox_vllm.audio.subprocess.run",
-                side_effect=successful_run,
+            with (
+                patch(
+                    "chatterbox_vllm.audio.subprocess.run",
+                    side_effect=successful_run,
+                ),
+                patch("builtins.print") as printed,
             ):
                 with normalized_reference_audio(
                     source,
@@ -117,6 +131,10 @@ class ReferenceAudioNormalizationTests(unittest.TestCase):
                     self.assertNotEqual(normalized, source)
                     self.assertIn("pcm_f32le", calls[1])
                     self.assertIn("24000", calls[1])
+
+            messages = [str(call.args[0]) for call in printed.call_args_list]
+            self.assertTrue(any("Input: -30.83 LUFS" in text for text in messages))
+            self.assertTrue(any("Output: -20.00 LUFS" in text for text in messages))
 
             self.assertEqual(source.read_bytes(), b"original")
             self.assertEqual(list(Path(directory).iterdir()), [source])
