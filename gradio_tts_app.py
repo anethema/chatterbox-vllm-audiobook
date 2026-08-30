@@ -1294,7 +1294,7 @@ with gr.Blocks(title="Chatterbox vLLM Audiobook") as demo:
                 )
                 with gr.Row():
                     max_chars = gr.Slider(
-                        120, 300, step=10, value=280,
+                        120, 300, step=10, value=200,
                         label="Maximum characters per speech chunk",
                     )
                     batch_size = gr.Slider(

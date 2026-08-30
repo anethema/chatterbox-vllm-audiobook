@@ -51,6 +51,12 @@ class GradioReferencePreviewTests(unittest.TestCase):
         self.assertEqual(gradio_tts_app.batch_size.value, 64)
         self.assertEqual(gradio_tts_app.batch_size.maximum, 64)
 
+    def test_multilingual_audiobook_defaults(self):
+        self.assertEqual(gradio_tts_app.max_chars.value, 200)
+        self.assertEqual(gradio_tts_app.min_p.value, 0.05)
+        self.assertEqual(gradio_tts_app.top_p.value, 1.0)
+        self.assertEqual(gradio_tts_app.repetition_penalty.value, 1.2)
+
 
 class AudioRecoveryTests(unittest.TestCase):
     sample_rate = 24000
