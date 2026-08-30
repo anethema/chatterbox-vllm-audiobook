@@ -21,6 +21,7 @@ from chatterbox_vllm.audio import (
     TARGET_LUFS,
     TRUE_PEAK_DBTP,
     limit_internal_pauses_wav,
+    normalized_reference_audio,
     normalize_speech_wav,
 )
 from chatterbox_vllm.background import BackgroundTaskPool
@@ -69,6 +70,7 @@ MINIMUM_MEMORY_HEADROOM = 2 * 1024 ** 3
 config_seed = None
 global_model = None
 generation_control = GenerationControl()
+reference_preview_directory: tempfile.TemporaryDirectory | None = None
 
 
 class GenerationStopped(Exception):
@@ -95,6 +97,25 @@ def selected_seed(seed_num) -> int | None:
         return None
     set_seed(seed)
     return seed
+
+
+def prepare_reference_preview(audio_prompt_path: str | None) -> str | None:
+    """Return a persistent normalized copy for Gradio playback and generation."""
+
+    if not audio_prompt_path:
+        return None
+    global reference_preview_directory
+    if reference_preview_directory is None:
+        reference_preview_directory = tempfile.TemporaryDirectory(
+            prefix="chatterbox-reference-previews-"
+        )
+    destination = (
+        Path(reference_preview_directory.name)
+        / f"normalized-reference-{uuid4().hex}.wav"
+    )
+    with normalized_reference_audio(audio_prompt_path, 24000) as normalized:
+        shutil.copyfile(normalized, destination)
+    return str(destination)
 
 
 def load_model():
@@ -703,7 +724,7 @@ with gr.Blocks(title="Chatterbox vLLM Audiobook") as demo:
             ref_wav = gr.Audio(
                 sources=["upload", "microphone"],
                 type="filepath",
-                label="Reference Audio File",
+                label="Reference Audio (normalized to -20 LUFS after upload)",
                 value=None,
             )
             exaggeration = gr.Slider(
@@ -789,6 +810,11 @@ with gr.Blocks(title="Chatterbox vLLM Audiobook") as demo:
                 run_btn = gr.Button("Generate Sample", variant="primary")
                 audio_output = gr.Audio(label="Output Audio")
 
+    ref_wav.input(
+        fn=prepare_reference_preview,
+        inputs=ref_wav,
+        outputs=ref_wav,
+    )
     run_btn.click(
         fn=generate_sample,
         inputs=[
@@ -839,11 +865,16 @@ with gr.Blocks(title="Chatterbox vLLM Audiobook") as demo:
         outputs=resume_project,
         queue=False,
     )
-    resume_project.change(
+    resume_project_event = resume_project.change(
         fn=inspect_resume_project,
         inputs=resume_project,
         outputs=[resume_info, epub_file, ref_wav],
         queue=False,
+    )
+    resume_project_event.then(
+        fn=prepare_reference_preview,
+        inputs=ref_wav,
+        outputs=ref_wav,
     )
     epub_generation_event.then(
         fn=lambda status: status,
