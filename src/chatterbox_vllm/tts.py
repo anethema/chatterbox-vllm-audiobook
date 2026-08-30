@@ -434,6 +434,7 @@ class ChatterboxTTS:
                         stop_token_ids=[self.t3_config.stop_speech_token + SPEECH_TOKEN_OFFSET],
                         max_tokens=min(max_tokens, self.max_model_len),
                         top_p=top_p,
+                        min_p=min_p,
                         repetition_penalty=repetition_penalty,
                         *args, **kwargs,
                     )
