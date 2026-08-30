@@ -45,6 +45,28 @@ class TextCleanupTests(unittest.TestCase):
         self.assertEqual(prepared, "Hello there.")
         self.assertEqual(changes, {"normalization": 1})
 
+    def test_expands_only_dotted_ascii_initialisms(self):
+        prepared, changes = prepare_tts_text(
+            "J.R.R. Tolkien visited the U.S. at 3.14 p.m. Dr. A.B. came too."
+        )
+
+        self.assertEqual(
+            prepared,
+            "J R R Tolkien visited the U S at 3.14 p.m. Dr. A B came too.",
+        )
+        self.assertEqual(changes["initialisms"], 3)
+
+    def test_removes_numeric_citations_attached_to_sentence_endings(self):
+        prepared, changes = prepare_tts_text(
+            'The first claim.188 "The second claim!"4 The third? 1914.'
+        )
+
+        self.assertEqual(
+            prepared,
+            "The first claim. The second claim! The third? 1914.",
+        )
+        self.assertEqual(changes["footnotes"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

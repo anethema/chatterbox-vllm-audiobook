@@ -28,21 +28,48 @@ class GradioReferencePreviewTests(unittest.TestCase):
             seen = []
 
             @contextmanager
-            def fake_normalization(path, sample_rate):
-                seen.append((path, sample_rate))
+            def fake_preparation(path, sample_rate, *, denoise=False):
+                seen.append((path, sample_rate, denoise))
                 yield normalized
 
             with patch.object(
                 gradio_tts_app,
-                "normalized_reference_audio",
-                side_effect=fake_normalization,
+                "prepared_reference_audio",
+                side_effect=fake_preparation,
             ):
                 preview = gradio_tts_app.prepare_reference_preview(str(source))
 
             self.assertEqual(Path(preview).read_bytes(), b"normalized")
             self.assertEqual(source.read_bytes(), b"original")
-            self.assertEqual(seen, [(str(source), 24000)])
+            self.assertEqual(seen, [(str(source), 24000, False)])
             self.assertIn("normalized-reference-", Path(preview).name)
+
+    def test_upload_keeps_source_while_player_uses_denoised_preview(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "quiet.mp3"
+            prepared = Path(directory) / "prepared.wav"
+            source.write_bytes(b"original")
+            prepared.write_bytes(b"denoised and normalized")
+
+            @contextmanager
+            def fake_preparation(path, sample_rate, *, denoise=False):
+                self.assertEqual(path, str(source))
+                self.assertEqual(sample_rate, 24000)
+                self.assertTrue(denoise)
+                yield prepared
+
+            with patch.object(
+                gradio_tts_app,
+                "prepared_reference_audio",
+                side_effect=fake_preparation,
+            ):
+                preview, retained_source = (
+                    gradio_tts_app.prepare_uploaded_reference(str(source), True)
+                )
+
+            self.assertEqual(Path(preview).read_bytes(), b"denoised and normalized")
+            self.assertEqual(retained_source, str(source))
+            self.assertEqual(source.read_bytes(), b"original")
 
     def test_clearing_reference_clears_player(self):
         self.assertIsNone(gradio_tts_app.prepare_reference_preview(None))
@@ -56,10 +83,20 @@ class GradioReferencePreviewTests(unittest.TestCase):
         self.assertEqual(gradio_tts_app.min_p.value, 0.05)
         self.assertEqual(gradio_tts_app.top_p.value, 1.0)
         self.assertEqual(gradio_tts_app.repetition_penalty.value, 1.2)
+        self.assertFalse(gradio_tts_app.denoise_reference.value)
 
 
 class AudioRecoveryTests(unittest.TestCase):
     sample_rate = 24000
+
+    def setUp(self):
+        self.vad_patch = patch(
+            "chatterbox_vllm.audio.default_silero_vad_detector."
+            "find_loud_no_speech_ranges",
+            return_value=(),
+        )
+        self.vad_patch.start()
+        self.addCleanup(self.vad_patch.stop)
 
     def good_audio(self):
         frame = self.sample_rate // 4
@@ -83,7 +120,7 @@ class AudioRecoveryTests(unittest.TestCase):
     def test_whole_chunk_retry_can_recover(self):
         split_calls = []
 
-        waveform = gradio_tts_app._recover_generated_waveform(
+        recovery = gradio_tts_app._recover_generated_waveform(
             self.bad_audio(),
             "A sentence that contains enough words for an ordinary speech test.",
             self.sample_rate,
@@ -93,10 +130,27 @@ class AudioRecoveryTests(unittest.TestCase):
         )
 
         self.assertEqual(split_calls, [])
+        self.assertTrue(recovery.detected_quality_issues)
+        self.assertEqual(recovery.retained_quality_issues, ())
         self.assertEqual(
-            gradio_tts_app.find_generated_audio_issues(waveform, self.sample_rate),
+            gradio_tts_app.find_generated_audio_issues(
+                recovery.waveform, self.sample_rate
+            ),
             [],
         )
+
+    def test_clean_waveform_is_not_marked_as_repaired_or_retained(self):
+        recovery = gradio_tts_app._recover_generated_waveform(
+            self.good_audio(),
+            "A clean sentence for the recovery-status test.",
+            self.sample_rate,
+            "chunk 000122",
+            self.good_audio,
+            lambda part: self.good_audio(),
+        )
+
+        self.assertFalse(recovery.detected_quality_issues)
+        self.assertEqual(recovery.retained_quality_issues, ())
 
     def test_second_failure_splits_text_and_combines_clean_parts(self):
         text = (
@@ -111,7 +165,7 @@ class AudioRecoveryTests(unittest.TestCase):
             part_calls.append(part)
             return self.good_audio()
 
-        waveform = gradio_tts_app._recover_generated_waveform(
+        recovery = gradio_tts_app._recover_generated_waveform(
             self.bad_audio(),
             text,
             self.sample_rate,
@@ -122,14 +176,16 @@ class AudioRecoveryTests(unittest.TestCase):
 
         self.assertEqual(len(part_calls), 2)
         self.assertEqual(
-            gradio_tts_app.find_generated_audio_issues(waveform, self.sample_rate),
+            gradio_tts_app.find_generated_audio_issues(
+                recovery.waveform, self.sample_rate
+            ),
             [],
         )
         expected_samples = (
             2 * self.good_audio().shape[1]
             + round(self.sample_rate * gradio_tts_app.SPLIT_JOIN_SILENCE_SECONDS)
         )
-        self.assertEqual(waveform.shape, (1, expected_samples))
+        self.assertEqual(recovery.waveform.shape, (1, expected_samples))
 
     def test_failed_multi_sentence_part_recursively_splits_to_sentences(self):
         text = (
@@ -145,7 +201,7 @@ class AudioRecoveryTests(unittest.TestCase):
                 return self.bad_audio()
             return self.good_audio()
 
-        waveform = gradio_tts_app._recover_generated_waveform(
+        recovery = gradio_tts_app._recover_generated_waveform(
             self.bad_audio(),
             text,
             self.sample_rate,
@@ -156,12 +212,14 @@ class AudioRecoveryTests(unittest.TestCase):
 
         self.assertGreater(len(calls), 2)
         self.assertEqual(
-            gradio_tts_app.find_generated_audio_issues(waveform, self.sample_rate),
+            gradio_tts_app.find_generated_audio_issues(
+                recovery.waveform, self.sample_rate
+            ),
             [],
         )
 
     def test_single_sentence_failure_is_included_instead_of_stopping(self):
-        waveform = gradio_tts_app._recover_generated_waveform(
+        recovery = gradio_tts_app._recover_generated_waveform(
             self.bad_audio(),
             "One sentence that repeatedly produces a digital audio artifact.",
             self.sample_rate,
@@ -171,8 +229,12 @@ class AudioRecoveryTests(unittest.TestCase):
         )
 
         self.assertTrue(
-            gradio_tts_app.find_generated_audio_issues(waveform, self.sample_rate)
+            gradio_tts_app.find_generated_audio_issues(
+                recovery.waveform, self.sample_rate
+            )
         )
+        self.assertTrue(recovery.detected_quality_issues)
+        self.assertTrue(recovery.retained_quality_issues)
 
     def test_retry_arguments_always_use_a_fresh_seed(self):
         used_seeds = set()
@@ -195,7 +257,7 @@ class AudioRecoveryTests(unittest.TestCase):
     def test_retained_split_noise_does_not_print_a_false_success(self):
         output = io.StringIO()
         with redirect_stdout(output):
-            waveform = gradio_tts_app._recover_generated_waveform(
+            recovery = gradio_tts_app._recover_generated_waveform(
                 self.bad_audio(),
                 "The first sentence fails. The second sentence also fails.",
                 self.sample_rate,
@@ -203,6 +265,7 @@ class AudioRecoveryTests(unittest.TestCase):
                 self.bad_audio,
                 lambda part: self.bad_audio(),
             )
+            waveform = recovery.waveform
 
         self.assertTrue(
             gradio_tts_app.find_generated_audio_issues(
@@ -211,6 +274,8 @@ class AudioRecoveryTests(unittest.TestCase):
         )
         self.assertIn("included anyway so generation can continue", output.getvalue())
         self.assertNotIn("combined waveform passed the full scan", output.getvalue())
+        self.assertTrue(recovery.detected_quality_issues)
+        self.assertTrue(recovery.retained_quality_issues)
 
     def test_quality_warnings_are_red_in_an_interactive_terminal(self):
         class InteractiveBuffer(io.StringIO):

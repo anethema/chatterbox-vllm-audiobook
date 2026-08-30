@@ -28,6 +28,10 @@ _NUMERIC_FOOTNOTE = re.compile(
 _TRAILING_SUPERSCRIPT_FOOTNOTE = re.compile(
     rf"(?<=\w)[{_SUPERSCRIPT_DIGITS}]+(?=(?:\s|$|[.,!?]))"
 )
+_DOTTED_INITIALISM = re.compile(r"(?<![A-Za-z])(?:[A-Z]\.){2,}")
+_ATTACHED_NUMERIC_REFERENCE = re.compile(
+    r"(?<!\d)([.!?](?:[\"'”’»\)\]])?)[0-9]+(?=\s|$)"
+)
 
 
 def clean_tts_text(text: str) -> tuple[str, Counter[str]]:
@@ -46,6 +50,18 @@ def clean_tts_text(text: str) -> tuple[str, Counter[str]]:
 
     text = _NUMERIC_FOOTNOTE.sub(remove_numeric_footnote, text)
     text = _TRAILING_SUPERSCRIPT_FOOTNOTE.sub(remove_numeric_footnote, text)
+
+    def remove_attached_reference(match: re.Match[str]) -> str:
+        changes["footnotes"] += 1
+        return match.group(1)
+
+    text = _ATTACHED_NUMERIC_REFERENCE.sub(remove_attached_reference, text)
+
+    def expand_initialism(match: re.Match[str]) -> str:
+        changes["initialisms"] += 1
+        return " ".join(match.group(0).replace(".", "").strip())
+
+    text = _DOTTED_INITIALISM.sub(expand_initialism, text)
 
     cleaned: list[str] = []
     for character in text:

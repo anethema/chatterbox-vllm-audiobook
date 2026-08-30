@@ -8,17 +8,21 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from typing import Iterator, Mapping
 from uuid import uuid4
 import wave
 
 import numpy as np
 
+from .silero_vad import default_silero_vad_detector
+
 
 TARGET_LUFS = -18.0
 TRUE_PEAK_DBTP = -2.0
 REFERENCE_TARGET_LUFS = -20.0
 REFERENCE_TRUE_PEAK_DBTP = -3.0
+REFERENCE_DENOISE_SAMPLE_RATE = 48_000
 LOUDNESS_RANGE_LU = 7.0
 MAX_INTERNAL_PAUSE_SECONDS = 0.5
 INTERNAL_PAUSE_THRESHOLD_DBFS = -50.0
@@ -188,6 +192,133 @@ def normalized_reference_audio(
         yield normalized
 
 
+def denoise_reference_audio(
+    path: str | Path,
+    output_path: str | Path,
+    *,
+    ffmpeg: str | None = None,
+) -> Path:
+    """Denoise a temporary 48 kHz mono copy with RNNoise."""
+
+    source = Path(path)
+    destination = Path(output_path)
+    ffmpeg = ffmpeg or shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("FFmpeg is required to prepare reference audio for denoising")
+
+    converted = destination.with_name(f".{destination.stem}-rnnoise-input.wav")
+    conversion_command = [
+        ffmpeg,
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        str(source),
+        "-ar",
+        str(REFERENCE_DENOISE_SAMPLE_RATE),
+        "-ac",
+        "1",
+        "-c:a",
+        "pcm_s16le",
+        str(converted),
+    ]
+    started = time.perf_counter()
+    print(f"[Reference denoise] Preparing RNNoise input: {source}", flush=True)
+    try:
+        converted_result = subprocess.run(
+            conversion_command,
+            capture_output=True,
+            text=True,
+        )
+        if converted_result.returncode != 0:
+            detail = converted_result.stderr.strip() or "unknown FFmpeg error"
+            raise RuntimeError(f"FFmpeg failed to prepare RNNoise input: {detail}")
+
+        from pyrnnoise import RNNoise
+
+        # pyrnnoise's file helper currently calls an obsolete audiolab Reader
+        # attribute (``rate`` rather than ``sample_rate``). Feed its supported
+        # array API directly so this path is independent of that adapter bug.
+        with wave.open(str(converted), "rb") as reader:
+            samples = np.frombuffer(
+                reader.readframes(reader.getnframes()),
+                dtype="<i2",
+            ).copy()
+        if samples.size == 0:
+            raise RuntimeError("Reference audio is empty after RNNoise conversion")
+
+        denoiser = RNNoise(REFERENCE_DENOISE_SAMPLE_RATE)
+        denoised_frames = [
+            frame
+            for _speech_probability, frame in denoiser.denoise_chunk(
+                samples[np.newaxis, :],
+                partial=True,
+            )
+        ]
+        if not denoised_frames:
+            raise RuntimeError("RNNoise did not return any denoised audio frames")
+        denoised = np.concatenate(denoised_frames, axis=1).squeeze(0)
+        denoised_pcm = np.clip(denoised, -32768, 32767).astype("<i2")
+        with wave.open(str(destination), "wb") as writer:
+            writer.setnchannels(1)
+            writer.setsampwidth(2)
+            writer.setframerate(REFERENCE_DENOISE_SAMPLE_RATE)
+            writer.writeframes(denoised_pcm.tobytes())
+        if not destination.is_file() or destination.stat().st_size == 0:
+            raise RuntimeError("RNNoise did not produce denoised reference audio")
+        print(
+            "[Reference denoise] Completed in "
+            f"{time.perf_counter() - started:.2f}s: {destination}",
+            flush=True,
+        )
+        return destination
+    finally:
+        converted.unlink(missing_ok=True)
+
+
+@contextmanager
+def prepared_reference_audio(
+    path: str | Path,
+    sample_rate: int,
+    *,
+    denoise: bool = False,
+    ffmpeg: str | None = None,
+) -> Iterator[Path]:
+    """Yield the exact denoised/normalized reference used for conditioning.
+
+    The source is never modified. If optional RNNoise processing fails, emit a
+    visible warning and safely fall back to normalizing the original reference.
+    """
+
+    source = Path(path)
+    normalization_source = source
+    with tempfile.TemporaryDirectory(prefix="chatterbox-reference-prep-") as directory:
+        if denoise:
+            denoised = Path(directory) / "denoised-reference.wav"
+            try:
+                normalization_source = denoise_reference_audio(
+                    source,
+                    denoised,
+                    ffmpeg=ffmpeg,
+                )
+            except Exception as error:
+                print(
+                    "[Reference denoise] WARNING: RNNoise failed; using the "
+                    f"original reference instead: {error}",
+                    flush=True,
+                )
+                normalization_source = source
+
+        with normalized_reference_audio(
+            normalization_source,
+            sample_rate,
+            ffmpeg=ffmpeg,
+        ) as normalized:
+            yield normalized
+
+
 def normalize_speech_wav(
     path: str | Path,
     sample_rate: int,
@@ -273,6 +404,8 @@ def _expand_quality_ranges(
 def find_generated_audio_issues(
     samples,
     sample_rate: int,
+    *,
+    include_vad: bool = False,
 ) -> list[AudioQualityIssue]:
     """Find known Chatterbox synthesis-collapse patterns anywhere.
 
@@ -413,6 +546,19 @@ def find_generated_audio_issues(
             )
         )
 
+    if include_vad:
+        for no_speech in default_silero_vad_detector.find_loud_no_speech_ranges(
+            flattened,
+            rate,
+        ):
+            issues.append(
+                AudioQualityIssue(
+                    "audible non-speech synthesis blob",
+                    no_speech.start_seconds,
+                    no_speech.end_seconds,
+                )
+            )
+
     return sorted(issues, key=lambda issue: (issue.start_seconds, issue.end_seconds))
 
 
@@ -430,7 +576,7 @@ def wav_generated_audio_issues(
     """Scan a normalized mono PCM16 chunk for generated-audio corruption."""
 
     samples = _read_pcm16_mono(Path(path), sample_rate).astype(np.float32) / 32768.0
-    return find_generated_audio_issues(samples, sample_rate)
+    return find_generated_audio_issues(samples, sample_rate, include_vad=True)
 
 
 def _read_pcm16_mono(path: Path, expected_sample_rate: int) -> np.ndarray:

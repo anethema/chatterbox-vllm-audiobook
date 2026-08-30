@@ -1,4 +1,5 @@
 import argparse
+from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
@@ -18,6 +19,7 @@ import torch
 import torchaudio as ta
 
 from chatterbox_vllm.audio import (
+    AudioQualityIssue,
     LOUDNESS_RANGE_LU,
     MAX_INTERNAL_PAUSE_SECONDS,
     TARGET_LUFS,
@@ -25,8 +27,8 @@ from chatterbox_vllm.audio import (
     find_generated_audio_issues,
     format_audio_quality_issues,
     limit_internal_pauses_wav,
-    normalized_reference_audio,
     normalize_speech_wav,
+    prepared_reference_audio,
     wav_generated_audio_issues,
 )
 from chatterbox_vllm.background import BackgroundTaskPool
@@ -106,6 +108,13 @@ class GeneratedAudioQualityError(ValueError):
         super().__init__(format_audio_quality_issues(list(self.issues)))
 
 
+@dataclass(frozen=True)
+class RecoveredWaveform:
+    waveform: torch.Tensor
+    detected_quality_issues: bool
+    retained_quality_issues: tuple[AudioQualityIssue, ...]
+
+
 def _quality_log(message: str, *, color: str | None = None) -> None:
     colors = {"red": "\033[1;31m", "green": "\033[1;32m", "yellow": "\033[1;33m"}
     if color in colors and hasattr(sys.stdout, "isatty") and sys.stdout.isatty():
@@ -172,8 +181,11 @@ def selected_seed(seed_num) -> int | None:
     return seed
 
 
-def prepare_reference_preview(audio_prompt_path: str | None) -> str | None:
-    """Return a persistent normalized copy for Gradio playback and generation."""
+def prepare_reference_preview(
+    audio_prompt_path: str | None,
+    denoise_reference: bool = False,
+) -> str | None:
+    """Return the persistent processed reference preview used for conditioning."""
 
     if not audio_prompt_path:
         return None
@@ -186,13 +198,30 @@ def prepare_reference_preview(audio_prompt_path: str | None) -> str | None:
         Path(reference_preview_directory.name)
         / f"normalized-reference-{uuid4().hex}.wav"
     )
-    with normalized_reference_audio(audio_prompt_path, 24000) as normalized:
-        shutil.copyfile(normalized, destination)
+    with prepared_reference_audio(
+        audio_prompt_path,
+        24000,
+        denoise=bool(denoise_reference),
+    ) as prepared:
+        shutil.copyfile(prepared, destination)
     print(
-        f"[Reference normalization] Gradio player now uses: {destination}",
+        "[Reference preparation] Gradio player and conditioning now use: "
+        f"{destination}",
         flush=True,
     )
     return str(destination)
+
+
+def prepare_uploaded_reference(
+    audio_prompt_path: str | None,
+    denoise_reference: bool,
+) -> tuple[str | None, str | None]:
+    """Process a user upload while retaining its untouched source path."""
+
+    return (
+        prepare_reference_preview(audio_prompt_path, denoise_reference),
+        audio_prompt_path,
+    )
 
 
 def load_model():
@@ -223,8 +252,8 @@ def generation_arguments(exaggeration, cfg_weight, temperature, diffusion_steps,
     }
 
 
-def generate_sample(text, audio_prompt_path, exaggeration, cfg_weight, temperature,
-                    seed_num, diffusion_steps, min_p, top_p,
+def generate_sample(text, audio_prompt_path, denoise_reference, exaggeration,
+                    cfg_weight, temperature, seed_num, diffusion_steps, min_p, top_p,
                     repetition_penalty):
     if not text or not text.strip():
         raise gr.Error("Enter some text to synthesize.")
@@ -242,9 +271,10 @@ def generate_sample(text, audio_prompt_path, exaggeration, cfg_weight, temperatu
     wav = global_model.generate(
         [text.strip()],
         audio_prompt_path=audio_prompt_path,
+        denoise_reference=bool(denoise_reference),
         **args,
     )
-    waveform = _recover_generated_waveform(
+    recovery = _recover_generated_waveform(
         wav[0],
         text.strip(),
         global_model.sr,
@@ -252,14 +282,17 @@ def generate_sample(text, audio_prompt_path, exaggeration, cfg_weight, temperatu
         lambda: global_model.generate(
             [text.strip()],
             audio_prompt_path=audio_prompt_path,
+            denoise_reference=bool(denoise_reference),
             **_retry_generation_args(args, retry_seeds),
         )[0],
         lambda part: global_model.generate(
             [part],
             audio_prompt_path=audio_prompt_path,
+            denoise_reference=bool(denoise_reference),
             **_retry_generation_args(args, retry_seeds),
         )[0],
     )
+    waveform = recovery.waveform
     with tempfile.TemporaryDirectory(prefix="chatterbox-preview-") as directory:
         output_path = Path(directory) / "preview.wav"
         ta.save(
@@ -312,12 +345,17 @@ def inspect_resume_project(project_name):
             "Select an incomplete project. Saved inputs will load automatically.",
             None,
             None,
+            False,
         )
     try:
         for label, name in incomplete_project_choices(OUTPUT_ROOT):
             if name == project_name:
                 project_dir = OUTPUT_ROOT / name
+                _, metadata = load_project_metadata(OUTPUT_ROOT, name)
                 saved_epub, saved_reference = saved_project_inputs(project_dir)
+                denoise_reference = bool(
+                    metadata.get("settings", {}).get("denoise_reference", False)
+                )
                 epub_status = "saved EPUB loaded" if saved_epub else "upload the original EPUB once"
                 reference_status = (
                     "saved reference audio loaded"
@@ -329,10 +367,16 @@ def inspect_resume_project(project_name):
                     "Resume validates the EPUB before writing.",
                     str(saved_epub) if saved_epub else None,
                     str(saved_reference) if saved_reference else None,
+                    denoise_reference,
                 )
-    except OSError as error:
-        return f"❌ Could not inspect incomplete projects: {error}", None, None
-    return "❌ The selected incomplete project is no longer available.", None, None
+    except (OSError, ResumeProjectError) as error:
+        return f"❌ Could not inspect incomplete projects: {error}", None, None, False
+    return (
+        "❌ The selected incomplete project is no longer available.",
+        None,
+        None,
+        False,
+    )
 
 
 def _safe_project_name(title: str) -> str:
@@ -365,7 +409,11 @@ def _waveform_for_save(
         raise ValueError(f"Generated audio is truncated ({duration:.2f}s for {words} words)")
     if duration > 15.0 + 5.0 * words:
         raise ValueError(f"Generated audio is implausibly long ({duration:.1f}s for {words} words)")
-    issues = find_generated_audio_issues(tensor.numpy(), sample_rate)
+    issues = find_generated_audio_issues(
+        tensor.numpy(),
+        sample_rate,
+        include_vad=True,
+    )
     if issues and not allow_quality_issues:
         raise GeneratedAudioQualityError(issues)
     return tensor
@@ -510,9 +558,13 @@ def _recover_generated_waveform(
     label: str,
     regenerate_whole,
     generate_part,
-) -> torch.Tensor:
+) -> RecoveredWaveform:
     try:
-        return _waveform_for_save(initial_audio, text, sample_rate)
+        return RecoveredWaveform(
+            _waveform_for_save(initial_audio, text, sample_rate),
+            False,
+            (),
+        )
     except GeneratedAudioQualityError as error:
         _quality_log(
             f"[Audio quality scan] {label}: found {error}",
@@ -533,7 +585,7 @@ def _recover_generated_waveform(
             "the full-waveform scan",
             color="green",
         )
-        return waveform
+        return RecoveredWaveform(waveform, True, ())
     except GeneratedAudioQualityError as retry_error:
         retry_failure = retry_error
         _quality_log(
@@ -549,11 +601,15 @@ def _recover_generated_waveform(
             f"{retry_failure}; included anyway so generation can continue",
             color="red",
         )
-        return _waveform_for_save(
-            retried_audio,
-            text,
-            sample_rate,
-            allow_quality_issues=True,
+        return RecoveredWaveform(
+            _waveform_for_save(
+                retried_audio,
+                text,
+                sample_rate,
+                allow_quality_issues=True,
+            ),
+            True,
+            tuple(retry_failure.issues),
         )
     _quality_log(
         f"[Audio quality repair] {label}: splitting repeatedly failed text "
@@ -573,11 +629,11 @@ def _recover_generated_waveform(
     ]
 
     combined = _join_split_waveforms(part_waveforms, sample_rate)
-    retained_quality_issues = False
+    retained_quality_issues = ()
     try:
         result = _waveform_for_save(combined, text, sample_rate)
     except GeneratedAudioQualityError as combined_error:
-        retained_quality_issues = True
+        retained_quality_issues = tuple(combined_error.issues)
         _quality_log(
             f"[Audio quality warning] {label}: combined sentence-sized output "
             f"retains {combined_error}; included anyway so generation can continue",
@@ -595,7 +651,11 @@ def _recover_generated_waveform(
             "parts; combined waveform passed the full scan",
             color="green",
         )
-    return result
+    return RecoveredWaveform(
+        result,
+        True,
+        retained_quality_issues,
+    )
 
 
 def _save_and_normalize_chunk(
@@ -710,7 +770,7 @@ def _protect_system_memory(batch_number: int) -> None:
 def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weight,
                             temperature, seed_num, diffusion_steps, min_p,
                             top_p, repetition_penalty, max_chars, batch_size,
-                            resume_project_name,
+                            denoise_reference, resume_project_name,
                             progress=gr.Progress()):
     resuming = bool(resume_project_name)
     if resuming:
@@ -748,6 +808,7 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
             project_dir = resume_plan.project_dir
             chunks = list(resume_plan.chunks)
             settings = dict(resume_plan.metadata["settings"])
+            denoise_reference = bool(settings.get("denoise_reference", False))
             active_project_model_id = project_model_id(resume_plan.metadata)
             source_epub_name = resume_plan.metadata.get(
                 "source_epub", source_epub_name,
@@ -784,6 +845,7 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
                         if active_project_model_id == MULTILINGUAL_V3_MODEL_ID
                         else None
                     ),
+                    "denoise_reference": bool(denoise_reference),
                 }
             )
 
@@ -872,7 +934,10 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
                 else f"{len(damaged_chunks):,} damaged chunks"
             )
             progress(0, desc=f"Preparing voice for {pending_description}")
-            s3gen_ref, cond_emb = global_model.get_audio_conditionals(audio_prompt_path)
+            s3gen_ref, cond_emb = global_model.get_audio_conditionals(
+                audio_prompt_path,
+                denoise_reference=bool(denoise_reference),
+            )
         elif audio_tasks is not None:
             progress(
                 0.975,
@@ -893,6 +958,7 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
                 "true_peak_dbtp",
                 "loudness_range_lu",
                 "maximum_internal_pause_seconds",
+                "denoise_reference",
             ):
                 repair_args.pop(metadata_key)
             repaired = global_model.generate_with_conds(
@@ -901,7 +967,7 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
                 cond_emb=cond_emb,
                 **_retry_generation_args(repair_args, retry_seeds),
             )[0]
-            waveform = _recover_generated_waveform(
+            recovery = _recover_generated_waveform(
                 repaired,
                 chunk.text,
                 global_model.sr,
@@ -923,6 +989,7 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
                     )[0]
                 ),
             )
+            waveform = recovery.waveform
             _save_and_normalize_chunk(
                 chunks_dir / f"{chunk_index:06d}.wav",
                 waveform,
@@ -1017,6 +1084,7 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
                 "true_peak_dbtp",
                 "loudness_range_lu",
                 "maximum_internal_pause_seconds",
+                "denoise_reference",
             ):
                 batch_args.pop(metadata_key)
             if seed is not None:
@@ -1036,15 +1104,7 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
             for offset, (chunk, audio) in enumerate(zip(batch, audios)):
                 chunk_index = start + offset
                 retry_seeds: set[int] = set()
-                initial_quality_issues = find_generated_audio_issues(
-                    audio.detach().cpu().numpy()
-                    if hasattr(audio, "detach")
-                    else audio,
-                    global_model.sr,
-                )
-                if initial_quality_issues:
-                    quality_detected_chunks.add(chunk_index)
-                waveform = _recover_generated_waveform(
+                recovery = _recover_generated_waveform(
                     audio,
                     chunk.text,
                     global_model.sr,
@@ -1066,10 +1126,11 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
                         )[0]
                     ),
                 )
-                final_quality_issues = find_generated_audio_issues(
-                    waveform.numpy(),
-                    global_model.sr,
-                )
+                waveform = recovery.waveform
+                initial_quality_issues = recovery.detected_quality_issues
+                final_quality_issues = recovery.retained_quality_issues
+                if initial_quality_issues:
+                    quality_detected_chunks.add(chunk_index)
                 if final_quality_issues:
                     retained_quality_chunks.append(chunk_index)
                     quality_detected_chunks.add(chunk_index)
@@ -1245,11 +1306,21 @@ with gr.Blocks(title="Chatterbox vLLM Audiobook") as demo:
     with gr.Row():
         with gr.Column(scale=1):
             gr.Markdown("### Voice and generation settings")
+            reference_source = gr.State(None)
             ref_wav = gr.Audio(
                 sources=["upload", "microphone"],
                 type="filepath",
-                label="Reference Audio (normalized to -20 LUFS after upload)",
+                label="Reference Audio (the processed conditioning audio)",
                 value=None,
+            )
+            denoise_reference = gr.Checkbox(
+                value=False,
+                label="Denoise reference before normalization (RNNoise)",
+                info=(
+                    "Optional. The player above will update to the exact processing "
+                    "used by both Text Sample and EPUB generation; the source file "
+                    "is never modified."
+                ),
             )
             exaggeration = gr.Slider(
                 0.25, 2, step=.05,
@@ -1335,14 +1406,20 @@ with gr.Blocks(title="Chatterbox vLLM Audiobook") as demo:
                 audio_output = gr.Audio(label="Output Audio")
 
     ref_wav.input(
+        fn=prepare_uploaded_reference,
+        inputs=[ref_wav, denoise_reference],
+        outputs=[ref_wav, reference_source],
+    )
+    denoise_reference.input(
         fn=prepare_reference_preview,
-        inputs=ref_wav,
+        inputs=[reference_source, denoise_reference],
         outputs=ref_wav,
     )
     run_btn.click(
         fn=generate_sample,
         inputs=[
-            text, ref_wav, exaggeration, cfg_weight, temp, seed_num,
+            text, reference_source, denoise_reference, exaggeration, cfg_weight,
+            temp, seed_num,
             diffusion_steps, min_p, top_p, repetition_penalty,
         ],
         outputs=audio_output,
@@ -1360,9 +1437,9 @@ with gr.Blocks(title="Chatterbox vLLM Audiobook") as demo:
     epub_generation_event = epub_btn.click(
         fn=generate_epub_audiobook,
         inputs=[
-            epub_file, ref_wav, exaggeration, cfg_weight, temp, seed_num,
+            epub_file, reference_source, exaggeration, cfg_weight, temp, seed_num,
             diffusion_steps, min_p, top_p, repetition_penalty, max_chars,
-            batch_size, new_project_state,
+            batch_size, denoise_reference, new_project_state,
         ],
         # Keep the textual result hidden while this event is running. Making a
         # visible Markdown component a live output causes Gradio to render the
@@ -1372,9 +1449,9 @@ with gr.Blocks(title="Chatterbox vLLM Audiobook") as demo:
     resume_generation_event = resume_epub_btn.click(
         fn=generate_epub_audiobook,
         inputs=[
-            epub_file, ref_wav, exaggeration, cfg_weight, temp, seed_num,
+            epub_file, reference_source, exaggeration, cfg_weight, temp, seed_num,
             diffusion_steps, min_p, top_p, repetition_penalty, max_chars,
-            batch_size, resume_project,
+            batch_size, denoise_reference, resume_project,
         ],
         outputs=[epub_audio_output, epub_result_status],
     )
@@ -1392,12 +1469,12 @@ with gr.Blocks(title="Chatterbox vLLM Audiobook") as demo:
     resume_project_event = resume_project.change(
         fn=inspect_resume_project,
         inputs=resume_project,
-        outputs=[resume_info, epub_file, ref_wav],
+        outputs=[resume_info, epub_file, reference_source, denoise_reference],
         queue=False,
     )
     resume_project_event.then(
         fn=prepare_reference_preview,
-        inputs=ref_wav,
+        inputs=[reference_source, denoise_reference],
         outputs=ref_wav,
     )
     epub_generation_event.then(

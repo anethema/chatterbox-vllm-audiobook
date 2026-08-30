@@ -2,6 +2,7 @@ import json
 import subprocess
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 import wave
@@ -9,14 +10,18 @@ import wave
 import numpy as np
 
 from chatterbox_vllm.audio import (
+    AudioQualityIssue,
     find_generated_audio_issues,
     format_audio_quality_issues,
     limit_internal_pauses_wav,
     loudness_filter,
     normalized_reference_audio,
+    prepared_reference_audio,
     normalize_speech_wav,
     reference_loudness_filter,
+    wav_generated_audio_issues,
 )
+from chatterbox_vllm.silero_vad import NoSpeechRange
 
 
 def write_pcm16_mono(path: Path, samples: np.ndarray, sample_rate: int) -> None:
@@ -147,8 +152,182 @@ class ReferenceAudioNormalizationTests(unittest.TestCase):
             reference_loudness_filter(silent)
 
 
+class ReferenceAudioPreparationTests(unittest.TestCase):
+    def test_enabled_denoising_precedes_normalization_and_preserves_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "quiet.mp3"
+            denoised = Path(directory) / "denoised.wav"
+            normalized = Path(directory) / "normalized.wav"
+            source.write_bytes(b"original")
+            denoised.write_bytes(b"denoised")
+            normalized.write_bytes(b"normalized")
+            events = []
+
+            def fake_denoise(path, output_path, *, ffmpeg=None):
+                events.append(("denoise", Path(path), Path(output_path), ffmpeg))
+                Path(output_path).write_bytes(b"denoised")
+                return Path(output_path)
+
+            @contextmanager
+            def fake_normalize(path, sample_rate, *, ffmpeg=None):
+                events.append(("normalize", Path(path), sample_rate))
+                yield normalized
+
+            with (
+                patch(
+                    "chatterbox_vllm.audio.denoise_reference_audio",
+                    side_effect=fake_denoise,
+                ),
+                patch(
+                    "chatterbox_vllm.audio.normalized_reference_audio",
+                    side_effect=fake_normalize,
+                ),
+            ):
+                with prepared_reference_audio(source, 24000, denoise=True) as result:
+                    self.assertEqual(result, normalized)
+
+            self.assertEqual(
+                events,
+                [
+                    (
+                        "denoise",
+                        source,
+                        unittest.mock.ANY,
+                        None,
+                    ),
+                    ("normalize", unittest.mock.ANY, 24000),
+                ],
+            )
+            self.assertEqual(events[0][2], events[1][1])
+            self.assertEqual(source.read_bytes(), b"original")
+
+    def test_disabled_denoising_skips_denoiser_and_normalizes_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "quiet.mp3"
+            normalized = Path(directory) / "normalized.wav"
+            source.write_bytes(b"original")
+            normalized.write_bytes(b"normalized")
+
+            @contextmanager
+            def fake_normalize(path, sample_rate, *, ffmpeg=None):
+                self.assertEqual(Path(path), source)
+                self.assertEqual(sample_rate, 24000)
+                yield normalized
+
+            with (
+                patch(
+                    "chatterbox_vllm.audio.denoise_reference_audio",
+                    side_effect=AssertionError("denoiser must remain disabled"),
+                ),
+                patch(
+                    "chatterbox_vllm.audio.normalized_reference_audio",
+                    side_effect=fake_normalize,
+                ),
+            ):
+                with prepared_reference_audio(source, 24000, denoise=False) as result:
+                    self.assertEqual(result, normalized)
+
+            self.assertEqual(source.read_bytes(), b"original")
+
+    def test_denoiser_failure_falls_back_to_normalizing_the_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "quiet.mp3"
+            normalized = Path(directory) / "normalized.wav"
+            source.write_bytes(b"original")
+            normalized.write_bytes(b"normalized")
+            printed = []
+
+            def failed_denoise(path, output_path, *, ffmpeg=None):
+                raise RuntimeError("RNNoise unavailable")
+
+            @contextmanager
+            def fake_normalize(path, sample_rate, *, ffmpeg=None):
+                self.assertEqual(Path(path), source)
+                yield normalized
+
+            with (
+                patch(
+                    "chatterbox_vllm.audio.denoise_reference_audio",
+                    side_effect=failed_denoise,
+                ),
+                patch(
+                    "chatterbox_vllm.audio.normalized_reference_audio",
+                    side_effect=fake_normalize,
+                ),
+                patch(
+                    "builtins.print",
+                    side_effect=lambda *args, **kwargs: printed.append(args[0]),
+                ),
+            ):
+                with prepared_reference_audio(source, 24000, denoise=True) as result:
+                    self.assertEqual(result, normalized)
+
+            self.assertEqual(source.read_bytes(), b"original")
+            self.assertTrue(any("Reference denoise" in message for message in printed))
+
+
 class GeneratedAudioQualityTests(unittest.TestCase):
     sample_rate = 24000
+
+    def test_excluding_vad_never_calls_the_detector(self):
+        waveform = np.zeros(self.sample_rate, dtype=np.float32)
+        with patch(
+            "chatterbox_vllm.audio.default_silero_vad_detector."
+            "find_loud_no_speech_ranges",
+            side_effect=AssertionError("VAD must remain disabled"),
+        ):
+            self.assertEqual(
+                find_generated_audio_issues(
+                    waveform,
+                    self.sample_rate,
+                    include_vad=False,
+                ),
+                [],
+            )
+
+    def test_including_vad_maps_no_speech_ranges_to_audio_issues(self):
+        waveform = np.zeros(3 * self.sample_rate, dtype=np.float32)
+        with patch(
+            "chatterbox_vllm.audio.default_silero_vad_detector."
+            "find_loud_no_speech_ranges",
+            return_value=(NoSpeechRange(0.5, 2.0),),
+        ) as detector:
+            issues = find_generated_audio_issues(
+                waveform,
+                self.sample_rate,
+                include_vad=True,
+            )
+
+        detector.assert_called_once()
+        self.assertEqual(
+            issues,
+            [
+                AudioQualityIssue(
+                    "audible non-speech synthesis blob",
+                    0.5,
+                    2.0,
+                )
+            ],
+        )
+
+    def test_wav_scanner_includes_vad(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "chunk.wav"
+            write_pcm16_mono(
+                source,
+                np.zeros(2 * self.sample_rate, dtype=np.int16),
+                self.sample_rate,
+            )
+            with patch(
+                "chatterbox_vllm.audio.default_silero_vad_detector."
+                "find_loud_no_speech_ranges",
+                return_value=(NoSpeechRange(0.25, 1.5),),
+            ) as detector:
+                issues = wav_generated_audio_issues(source, self.sample_rate)
+
+        detector.assert_called_once()
+        self.assertEqual(issues[0].kind, "audible non-speech synthesis blob")
+        self.assertEqual((issues[0].start_seconds, issues[0].end_seconds), (0.25, 1.5))
 
     def test_detects_a_stable_digital_tone_with_normal_audio_after_it(self):
         frame = self.sample_rate // 4

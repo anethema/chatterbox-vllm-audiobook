@@ -38,6 +38,7 @@ def main() -> None:
             str(source),
             "docs/audio-sample-01.mp3",
             0.5,
+            0.5,
             0.8,
             1234,
             10,
@@ -46,6 +47,7 @@ def main() -> None:
             1.2,
             120,
             1,
+            True,
             None,
             progress=report_progress,
         )
@@ -63,7 +65,11 @@ def main() -> None:
             raise RuntimeError("Completed project did not retain its source EPUB")
         if not saved_reference or not saved_reference.is_file():
             raise RuntimeError("Completed project did not retain its reference audio")
+        if saved_reference.read_bytes() != Path("docs/audio-sample-01.mp3").read_bytes():
+            raise RuntimeError("Reference preparation modified the persisted source audio")
         metadata = json.loads((Path(output).parent / "metadata.json").read_text())
+        if metadata["settings"].get("denoise_reference") is not True:
+            raise RuntimeError("Project metadata did not retain reference denoising")
         print("COMPLETED_CHUNKS", metadata["completed_chunks"])
         print("TOTAL_CHUNKS", metadata["total_chunks"])
         print("OUTPUT_BYTES", Path(output).stat().st_size)
@@ -113,6 +119,7 @@ def main() -> None:
             str(source),
             "docs/audio-sample-01.mp3",
             0.5,
+            0.5,
             0.8,
             5678,
             10,
@@ -121,6 +128,7 @@ def main() -> None:
             1.2,
             120,
             1,
+            False,
             None,
             progress=stop_after_first_batch,
         )
@@ -142,6 +150,7 @@ def main() -> None:
             None,
             None,
             0.5,
+            0.5,
             0.8,
             0,
             15,
@@ -150,6 +159,7 @@ def main() -> None:
             1.2,
             280,
             16,
+            False,
             stopped_project.name,
             progress=report_progress,
         )
@@ -172,6 +182,7 @@ def main() -> None:
                 str(source),
                 "docs/audio-sample-01.mp3",
                 0.5,
+                0.5,
                 0.8,
                 9012,
                 10,
@@ -180,6 +191,7 @@ def main() -> None:
                 1.2,
                 120,
                 1,
+                False,
                 None,
                 progress=report_progress,
             )
@@ -196,16 +208,19 @@ def main() -> None:
         saved_epub, saved_reference = app.saved_project_inputs(paused_project)
         if not saved_epub or not saved_reference:
             raise RuntimeError("Paused project did not retain both generation inputs")
-        resume_info, loaded_epub, loaded_reference = app.inspect_resume_project(
-            paused_project.name
+        resume_info, loaded_epub, loaded_reference, loaded_denoise = (
+            app.inspect_resume_project(paused_project.name)
         )
         print("RESUME_INPUT_STATUS", resume_info)
         if loaded_epub != str(saved_epub) or loaded_reference != str(saved_reference):
             raise RuntimeError("Resume selection did not restore the saved inputs")
+        if loaded_denoise:
+            raise RuntimeError("Resume selection changed the saved denoise setting")
 
         resumed_output, resumed_status = app.generate_epub_audiobook(
             None,
             None,
+            0.5,
             0.5,
             0.8,
             0,
@@ -215,6 +230,7 @@ def main() -> None:
             1.2,
             280,
             16,
+            False,
             paused_project.name,
             progress=report_progress,
         )
