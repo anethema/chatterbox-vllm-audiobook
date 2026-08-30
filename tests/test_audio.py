@@ -9,6 +9,8 @@ import wave
 import numpy as np
 
 from chatterbox_vllm.audio import (
+    find_generated_audio_issues,
+    format_audio_quality_issues,
     limit_internal_pauses_wav,
     loudness_filter,
     normalized_reference_audio,
@@ -143,6 +145,86 @@ class ReferenceAudioNormalizationTests(unittest.TestCase):
         silent = dict(self.measurements, input_i="-inf")
         with self.assertRaisesRegex(RuntimeError, "silent or too quiet"):
             reference_loudness_filter(silent)
+
+
+class GeneratedAudioQualityTests(unittest.TestCase):
+    sample_rate = 24000
+
+    def test_detects_a_stable_digital_tone_with_normal_audio_after_it(self):
+        frame = self.sample_rate // 4
+        time_axis = np.arange(frame, dtype=np.float32) / self.sample_rate
+        speech_like = np.concatenate(
+            [
+                0.2 * np.sin(2 * np.pi * frequency * time_axis)
+                for frequency in (180, 230, 140, 310) * 3
+            ]
+        )
+        bad_section = 0.2 * np.sin(
+            2 * np.pi * 2100 * np.arange(2 * self.sample_rate) / self.sample_rate
+        )
+        waveform = np.concatenate([speech_like, bad_section, speech_like])
+
+        issues = find_generated_audio_issues(waveform, self.sample_rate)
+        self.assertTrue(any(issue.kind == "sustained synthetic tone" for issue in issues))
+        self.assertIn("3.00-5.00s", format_audio_quality_issues(issues))
+
+    def test_detects_a_broadband_digital_noise_blob_in_the_middle(self):
+        rng = np.random.default_rng(42)
+        time_axis = np.arange(2 * self.sample_rate, dtype=np.float32) / self.sample_rate
+        speech_like = 0.2 * np.sin(2 * np.pi * 180 * time_axis)
+        digital_noise = rng.normal(0, 0.12, round(1.5 * self.sample_rate))
+        waveform = np.concatenate([speech_like, digital_noise, speech_like])
+
+        issues = find_generated_audio_issues(waveform, self.sample_rate)
+
+        self.assertTrue(any(issue.kind == "broadband digital noise" for issue in issues))
+        self.assertIn("2.00-3.50s", format_audio_quality_issues(issues))
+
+    def test_detects_a_low_frequency_synthesis_collapse(self):
+        frame = self.sample_rate // 4
+        time_axis = np.arange(frame, dtype=np.float32) / self.sample_rate
+        speech_like = np.concatenate(
+            [
+                0.12 * np.sin(2 * np.pi * fundamental * time_axis)
+                + 0.10 * np.sin(2 * np.pi * 2 * fundamental * time_axis)
+                + 0.08 * np.sin(2 * np.pi * 3 * fundamental * time_axis)
+                for fundamental in (95, 110, 130, 105) * 3
+            ]
+        )
+        collapse_time = (
+            np.arange(2 * self.sample_rate, dtype=np.float32)
+            / self.sample_rate
+        )
+        collapse = (
+            0.22 * np.sin(2 * np.pi * 60 * collapse_time)
+            + 0.03 * np.sin(2 * np.pi * 180 * collapse_time)
+        )
+        waveform = np.concatenate([speech_like, collapse, speech_like])
+
+        issues = find_generated_audio_issues(waveform, self.sample_rate)
+
+        self.assertTrue(
+            any(
+                issue.kind == "low-frequency synthesis collapse"
+                for issue in issues
+            )
+        )
+        self.assertIn(
+            "low-frequency synthesis collapse at 3.00-",
+            format_audio_quality_issues(issues),
+        )
+
+    def test_allows_a_varied_speech_like_tail(self):
+        frame = self.sample_rate // 4
+        time_axis = np.arange(frame, dtype=np.float32) / self.sample_rate
+        waveform = np.concatenate(
+            [
+                0.2 * np.sin(2 * np.pi * frequency * time_axis)
+                for frequency in (130, 210, 170, 280, 150, 240, 190, 320, 160)
+            ]
+        )
+
+        self.assertEqual(find_generated_audio_issues(waveform, self.sample_rate), [])
 
 
 class InternalPauseLimitingTests(unittest.TestCase):

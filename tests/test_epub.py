@@ -4,7 +4,14 @@ import unittest
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile
 
-from chatterbox_vllm.epub import EpubError, chunk_book, chunk_text, load_epub, split_sentences
+from chatterbox_vllm.epub import (
+    EpubError,
+    chunk_book,
+    chunk_text,
+    load_epub,
+    split_sentences,
+    split_text_for_recovery,
+)
 
 
 CONTAINER = """<?xml version="1.0"?>
@@ -92,6 +99,30 @@ class EpubTests(unittest.TestCase):
     def test_chunks_pathologically_long_word_without_exceeding_limit(self):
         chunks = chunk_text("A prefix " + ("x" * 205) + ".", max_chars=100)
         self.assertTrue(all(len(chunk) <= 100 for chunk in chunks))
+
+    def test_recovery_split_prefers_a_balanced_sentence_boundary(self):
+        text = (
+            "If the most talented among us are preoccupied with maintaining the "
+            "barrier and making life inside more pleasant, then what about the "
+            "threats outside? They will only grow worse with time.” Brynn took "
+            "Samuel’s hand."
+        )
+
+        self.assertEqual(
+            split_text_for_recovery(text),
+            [
+                "If the most talented among us are preoccupied with maintaining "
+                "the barrier and making life inside more pleasant, then what "
+                "about the threats outside?",
+                "They will only grow worse with time.” Brynn took Samuel’s hand.",
+            ],
+        )
+
+    def test_recovery_split_uses_a_clause_or_word_boundary_for_one_sentence(self):
+        self.assertEqual(
+            split_text_for_recovery("Alpha beta gamma, delta epsilon zeta."),
+            ["Alpha beta gamma,", "delta epsilon zeta."],
+        )
 
     def test_chunks_do_not_cross_chapter_boundaries(self):
         with tempfile.TemporaryDirectory() as directory:

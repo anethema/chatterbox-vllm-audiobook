@@ -393,6 +393,38 @@ def chunk_text(text: str, max_chars: int = 280) -> list[str]:
     return chunks
 
 
+def split_text_for_recovery(text: str) -> list[str]:
+    """Split one failed speech chunk into two natural, balanced pieces."""
+
+    normalized = " ".join(text.split())
+    sentences = split_sentences(normalized)
+    if len(sentences) >= 2:
+        candidates = []
+        for index in range(1, len(sentences)):
+            left = " ".join(sentences[:index])
+            right = " ".join(sentences[index:])
+            candidates.append((abs(len(left) - len(right)), left, right))
+        _, left, right = min(candidates, key=lambda candidate: candidate[0])
+        return [left, right]
+
+    midpoint = len(normalized) / 2
+    boundaries = [
+        match.end()
+        for match in re.finditer(r"[,;:—–]\s+", normalized)
+    ]
+    if not boundaries:
+        boundaries = [
+            match.start()
+            for match in re.finditer(r"\s+", normalized)
+        ]
+    if not boundaries:
+        return [normalized]
+    boundary = min(boundaries, key=lambda index: abs(index - midpoint))
+    left = normalized[:boundary].strip()
+    right = normalized[boundary:].strip()
+    return [part for part in (left, right) if part]
+
+
 def chunk_book(book: EpubBook, max_chars: int = 280) -> list[TextChunk]:
     chunks: list[TextChunk] = []
     for chapter_index, chapter in enumerate(book.chapters):

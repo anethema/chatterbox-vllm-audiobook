@@ -1,4 +1,5 @@
 from contextlib import contextmanager
+from dataclasses import dataclass
 import json
 import math
 import os
@@ -23,6 +24,31 @@ MAX_INTERNAL_PAUSE_SECONDS = 0.5
 INTERNAL_PAUSE_THRESHOLD_DBFS = -50.0
 INTERNAL_PAUSE_FRAME_SECONDS = 0.01
 ZERO_CROSSING_SEARCH_SECONDS = 0.005
+AUDIO_QUALITY_FRAME_SECONDS = 0.25
+AUDIO_QUALITY_MINIMUM_DBFS = -38.0
+BROADBAND_NOISE_MINIMUM_SECONDS = 1.0
+BROADBAND_NOISE_MINIMUM_ZERO_CROSSING_RATE = 0.22
+BROADBAND_NOISE_MINIMUM_CENTROID_HZ = 2200.0
+BROADBAND_NOISE_MINIMUM_FLATNESS = 0.07
+TONAL_NOISE_MINIMUM_SECONDS = 2.0
+TONAL_NOISE_MINIMUM_FREQUENCY_HZ = 500.0
+TONAL_NOISE_MAXIMUM_FREQUENCY_MAD_HZ = 60.0
+TONAL_NOISE_MAXIMUM_CENTROID_MAD_HZ = 250.0
+TONAL_NOISE_MAXIMUM_CENTROID_OFFSET_HZ = 400.0
+TONAL_NOISE_MAXIMUM_LEVEL_RANGE_DB = 12.0
+TONAL_NOISE_MAXIMUM_FLATNESS = 0.04
+LOW_FREQUENCY_COLLAPSE_MINIMUM_SECONDS = 1.0
+LOW_FREQUENCY_COLLAPSE_MAXIMUM_HZ = 120.0
+LOW_FREQUENCY_COLLAPSE_MINIMUM_POWER_FRACTION = 0.80
+LOW_FREQUENCY_COLLAPSE_MAXIMUM_DOMINANT_HZ = 100.0
+LOW_FREQUENCY_COLLAPSE_MINIMUM_DBFS = -35.0
+
+
+@dataclass(frozen=True)
+class AudioQualityIssue:
+    kind: str
+    start_seconds: float
+    end_seconds: float
 
 
 def loudness_filter() -> str:
@@ -208,6 +234,203 @@ def normalize_speech_wav(
     finally:
         temporary.unlink(missing_ok=True)
     return source
+
+
+def _quality_ranges(mask: np.ndarray, minimum_frames: int) -> list[tuple[int, int]]:
+    ranges: list[tuple[int, int]] = []
+    start: int | None = None
+    for index, flagged in enumerate(mask):
+        if flagged and start is None:
+            start = index
+        elif not flagged and start is not None:
+            if index - start >= minimum_frames:
+                ranges.append((start, index))
+            start = None
+    if start is not None and len(mask) - start >= minimum_frames:
+        ranges.append((start, len(mask)))
+    return ranges
+
+
+def _expand_quality_ranges(
+    ranges: list[tuple[int, int]],
+    support: np.ndarray,
+) -> list[tuple[int, int]]:
+    """Expand high-confidence detections across their adjacent artifact frames."""
+
+    expanded: list[tuple[int, int]] = []
+    for start, end in ranges:
+        while start > 0 and support[start - 1]:
+            start -= 1
+        while end < len(support) and support[end]:
+            end += 1
+        if expanded and start <= expanded[-1][1]:
+            expanded[-1] = (expanded[-1][0], max(expanded[-1][1], end))
+        else:
+            expanded.append((start, end))
+    return expanded
+
+
+def find_generated_audio_issues(
+    samples,
+    sample_rate: int,
+) -> list[AudioQualityIssue]:
+    """Find known Chatterbox synthesis-collapse patterns anywhere.
+
+    Chatterbox can emit invalid speech-token runs in the middle of otherwise
+    valid speech and then recover. Analyze every complete 250 ms frame so those
+    failures are not hidden merely because the final seconds sound normal.
+    """
+
+    rate = int(sample_rate)
+    if rate <= 0:
+        return []
+    frame_size = max(1, round(rate * AUDIO_QUALITY_FRAME_SECONDS))
+    flattened = np.asarray(samples, dtype=np.float32).reshape(-1)
+    frame_count = flattened.size // frame_size
+    if frame_count < 1:
+        return []
+
+    frames = flattened[:frame_count * frame_size].reshape(frame_count, frame_size)
+    frames = frames - np.mean(frames, axis=1, keepdims=True)
+    rms = np.sqrt(np.mean(frames * frames, axis=1) + 1e-12)
+    rms_dbfs = 20.0 * np.log10(rms + 1e-12)
+    zero_crossings = np.mean(
+        np.signbit(frames[:, :-1]) != np.signbit(frames[:, 1:]), axis=1
+    )
+
+    window = np.hanning(frame_size).astype(np.float32)
+    power = np.abs(np.fft.rfft(frames * window, axis=1)) ** 2
+    power[:, 0] = 0
+    frequencies = np.fft.rfftfreq(frame_size, 1.0 / rate)
+    totals = np.sum(power, axis=1) + 1e-30
+    dominant = frequencies[np.argmax(power, axis=1)]
+    centroids = np.sum(power * frequencies, axis=1) / totals
+    flatness = np.exp(np.mean(np.log(power + 1e-30), axis=1)) / (
+        np.mean(power, axis=1) + 1e-30
+    )
+
+    issues: list[AudioQualityIssue] = []
+
+    low_frequency_power = np.sum(
+        power[:, frequencies <= LOW_FREQUENCY_COLLAPSE_MAXIMUM_HZ],
+        axis=1,
+    ) / totals
+    low_frequency_core = (
+        (rms_dbfs >= LOW_FREQUENCY_COLLAPSE_MINIMUM_DBFS)
+        & (
+            low_frequency_power
+            >= LOW_FREQUENCY_COLLAPSE_MINIMUM_POWER_FRACTION
+        )
+    )
+    low_frequency_support = (
+        (rms_dbfs >= LOW_FREQUENCY_COLLAPSE_MINIMUM_DBFS)
+        & (dominant <= LOW_FREQUENCY_COLLAPSE_MAXIMUM_DOMINANT_HZ)
+    )
+    low_frequency_frames = max(
+        1,
+        round(
+            LOW_FREQUENCY_COLLAPSE_MINIMUM_SECONDS
+            / AUDIO_QUALITY_FRAME_SECONDS
+        ),
+    )
+    low_frequency_ranges = _quality_ranges(
+        low_frequency_core,
+        low_frequency_frames,
+    )
+    for start, end in _expand_quality_ranges(
+        low_frequency_ranges,
+        low_frequency_support,
+    ):
+        issues.append(
+            AudioQualityIssue(
+                "low-frequency synthesis collapse",
+                start * AUDIO_QUALITY_FRAME_SECONDS,
+                end * AUDIO_QUALITY_FRAME_SECONDS,
+            )
+        )
+
+    broadband = (
+        (rms_dbfs >= AUDIO_QUALITY_MINIMUM_DBFS)
+        & (zero_crossings >= BROADBAND_NOISE_MINIMUM_ZERO_CROSSING_RATE)
+        & (centroids >= BROADBAND_NOISE_MINIMUM_CENTROID_HZ)
+        & (flatness >= BROADBAND_NOISE_MINIMUM_FLATNESS)
+    )
+    broadband_frames = max(
+        1, round(BROADBAND_NOISE_MINIMUM_SECONDS / AUDIO_QUALITY_FRAME_SECONDS)
+    )
+    for start, end in _quality_ranges(broadband, broadband_frames):
+        issues.append(
+            AudioQualityIssue(
+                "broadband digital noise",
+                start * AUDIO_QUALITY_FRAME_SECONDS,
+                end * AUDIO_QUALITY_FRAME_SECONDS,
+            )
+        )
+
+    tonal_frames = max(
+        1, round(TONAL_NOISE_MINIMUM_SECONDS / AUDIO_QUALITY_FRAME_SECONDS)
+    )
+    tonal = np.zeros(frame_count, dtype=bool)
+    for start in range(0, frame_count - tonal_frames + 1):
+        end = start + tonal_frames
+        levels = rms_dbfs[start:end]
+        tones = dominant[start:end]
+        centers = centroids[start:end]
+        texture = flatness[start:end]
+        tone_median = float(np.median(tones))
+        center_median = float(np.median(centers))
+        if (
+            float(np.min(levels)) >= AUDIO_QUALITY_MINIMUM_DBFS
+            and float(np.max(levels) - np.min(levels))
+            <= TONAL_NOISE_MAXIMUM_LEVEL_RANGE_DB
+            and tone_median >= TONAL_NOISE_MINIMUM_FREQUENCY_HZ
+            and float(np.median(np.abs(tones - tone_median)))
+            <= TONAL_NOISE_MAXIMUM_FREQUENCY_MAD_HZ
+            and float(np.median(np.abs(centers - center_median)))
+            <= TONAL_NOISE_MAXIMUM_CENTROID_MAD_HZ
+            and float(np.median(np.abs(centers - tones)))
+            <= TONAL_NOISE_MAXIMUM_CENTROID_OFFSET_HZ
+            and float(np.median(texture)) <= TONAL_NOISE_MAXIMUM_FLATNESS
+        ):
+            tonal[start:end] |= (
+                (levels >= AUDIO_QUALITY_MINIMUM_DBFS)
+                & (
+                    np.abs(tones - tone_median)
+                    <= 2 * TONAL_NOISE_MAXIMUM_FREQUENCY_MAD_HZ
+                )
+                & (
+                    np.abs(centers - center_median)
+                    <= 2 * TONAL_NOISE_MAXIMUM_CENTROID_MAD_HZ
+                )
+                & (texture <= TONAL_NOISE_MAXIMUM_FLATNESS)
+            )
+    for start, end in _quality_ranges(tonal, tonal_frames):
+        issues.append(
+            AudioQualityIssue(
+                "sustained synthetic tone",
+                start * AUDIO_QUALITY_FRAME_SECONDS,
+                end * AUDIO_QUALITY_FRAME_SECONDS,
+            )
+        )
+
+    return sorted(issues, key=lambda issue: (issue.start_seconds, issue.end_seconds))
+
+
+def format_audio_quality_issues(issues: list[AudioQualityIssue]) -> str:
+    return "; ".join(
+        f"{issue.kind} at {issue.start_seconds:.2f}-{issue.end_seconds:.2f}s"
+        for issue in issues
+    )
+
+
+def wav_generated_audio_issues(
+    path: str | Path,
+    sample_rate: int,
+) -> list[AudioQualityIssue]:
+    """Scan a normalized mono PCM16 chunk for generated-audio corruption."""
+
+    samples = _read_pcm16_mono(Path(path), sample_rate).astype(np.float32) / 32768.0
+    return find_generated_audio_issues(samples, sample_rate)
 
 
 def _read_pcm16_mono(path: Path, expected_sample_rate: int) -> np.ndarray:
