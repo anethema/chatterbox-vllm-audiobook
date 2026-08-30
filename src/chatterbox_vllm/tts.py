@@ -23,7 +23,7 @@ from .audio import normalized_reference_audio
 from .models.t3 import SPEECH_TOKEN_OFFSET
 from .models.t3.modules.cond_enc import T3Cond, T3CondEnc
 from .models.t3.modules.learned_pos_emb import LearnedPositionEmbeddings
-from .text_utils import punc_norm, SUPPORTED_LANGUAGES
+from .text_utils import prepare_tts_text, SUPPORTED_LANGUAGES
 from .model_variants import (
     ENGLISH_V1_MODEL_ID,
     MULTILINGUAL_CHECKPOINTS,
@@ -402,8 +402,31 @@ class ChatterboxTTS:
         if not 0.0 <= cfg_weight <= 1.0:
             raise ValueError("cfg_weight must be between 0.0 and 1.0")
 
-        # Norm and tokenize text
-        prompts = ["[START]" + punc_norm(p) + "[STOP]" for p in prompts]
+        # Clean only the transient inference prompts.  EPUB chunks and project
+        # metadata retain their original source text for resumes and auditing.
+        cleaned_prompts = []
+        cleanup_counts = {}
+        changed_prompt_count = 0
+        for prompt in prompts:
+            cleaned_prompt, changes = prepare_tts_text(prompt)
+            cleaned_prompts.append(cleaned_prompt)
+            if changes:
+                changed_prompt_count += 1
+                for category, count in changes.items():
+                    cleanup_counts[category] = cleanup_counts.get(category, 0) + count
+        if changed_prompt_count:
+            details = ", ".join(
+                f"{category}={count}"
+                for category, count in sorted(cleanup_counts.items())
+            )
+            print(
+                "[Text cleanup] Batch: "
+                f"{changed_prompt_count}/{len(prompts)} prompts changed ({details})",
+                flush=True,
+            )
+
+        # Add control tokens only after the user/book text is cleaned.
+        prompts = ["[START]" + prompt + "[STOP]" for prompt in cleaned_prompts]
 
         # For multilingual, prepend the language token
         if self.variant == "multilingual":

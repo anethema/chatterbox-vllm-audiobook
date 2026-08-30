@@ -274,7 +274,9 @@ _ABBREVIATIONS = {
     "capt", "col", "dr", "e.g", "etc", "fig", "gen", "i.e", "jr", "lt",
     "mr", "mrs", "ms", "no", "prof", "rev", "sen", "sgt", "sr", "st", "vs",
 }
-_CLOSING_PUNCTUATION = '"\'”’)]}'
+_CLOSING_PUNCTUATION = '"\'”’»)]}'
+_DIALOGUE_DOUBLE_QUOTES = frozenset('"“”„‟«»')
+_MIN_STANDALONE_DIALOGUE_CHARS = 80
 
 
 def _is_nonterminal_period(text: str, period_index: int) -> bool:
@@ -381,7 +383,17 @@ def chunk_text(text: str, max_chars: int = 280) -> list[str]:
     current = ""
     for sentence in split_sentences(text):
         sentence_parts = [sentence] if len(sentence) <= max_chars else _split_oversized(sentence, max_chars)
+        is_dialogue_turn = (
+            len(sentence) >= _MIN_STANDALONE_DIALOGUE_CHARS
+            and any(mark in sentence for mark in _DIALOGUE_DOUBLE_QUOTES)
+        )
+        if is_dialogue_turn and current:
+            chunks.append(current)
+            current = ""
         for part in sentence_parts:
+            if is_dialogue_turn:
+                chunks.append(part)
+                continue
             candidate = f"{current} {part}".strip()
             if current and len(candidate) > max_chars:
                 chunks.append(current)
