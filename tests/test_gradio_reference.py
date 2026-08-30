@@ -42,8 +42,8 @@ class GradioReferencePreviewTests(unittest.TestCase):
     def test_clearing_reference_clears_player(self):
         self.assertIsNone(gradio_tts_app.prepare_reference_preview(None))
 
-    def test_batch_slider_defaults_to_32_and_allows_64(self):
-        self.assertEqual(gradio_tts_app.batch_size.value, 32)
+    def test_batch_slider_defaults_to_and_allows_64(self):
+        self.assertEqual(gradio_tts_app.batch_size.value, 64)
         self.assertEqual(gradio_tts_app.batch_size.maximum, 64)
 
 
