@@ -1,3 +1,4 @@
+import json
 import subprocess
 import tempfile
 import unittest
@@ -10,7 +11,9 @@ import numpy as np
 from chatterbox_vllm.audio import (
     limit_internal_pauses_wav,
     loudness_filter,
+    normalized_reference_audio,
     normalize_speech_wav,
+    reference_loudness_filter,
 )
 
 
@@ -66,6 +69,62 @@ class AudioNormalizationTests(unittest.TestCase):
 
             self.assertEqual(source.read_bytes(), b"original")
             self.assertEqual(list(Path(directory).iterdir()), [source])
+
+
+class ReferenceAudioNormalizationTests(unittest.TestCase):
+    measurements = {
+        "input_i": "-30.83",
+        "input_tp": "-17.97",
+        "input_lra": "1.70",
+        "input_thresh": "-40.96",
+        "target_offset": "0.24",
+    }
+
+    def test_uses_quiet_reference_targets_and_linear_second_pass(self):
+        first_pass = reference_loudness_filter()
+        second_pass = reference_loudness_filter(self.measurements)
+
+        self.assertIn("aformat=channel_layouts=mono", first_pass)
+        self.assertIn("loudnorm=I=-20:TP=-3:LRA=7", first_pass)
+        self.assertIn("measured_I=-30.83", second_pass)
+        self.assertIn("measured_TP=-17.97", second_pass)
+        self.assertIn("linear=true", second_pass)
+
+    def test_normalizes_a_temporary_copy_and_preserves_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "quiet.mp3"
+            source.write_bytes(b"original")
+            calls = []
+
+            def successful_run(command, **kwargs):
+                calls.append(command)
+                if len(calls) == 1:
+                    stderr = "analysis\n" + json.dumps(self.measurements)
+                    return subprocess.CompletedProcess(command, 0, "", stderr)
+                Path(command[-1]).write_bytes(b"normalized")
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            with patch(
+                "chatterbox_vllm.audio.subprocess.run",
+                side_effect=successful_run,
+            ):
+                with normalized_reference_audio(
+                    source,
+                    24000,
+                    ffmpeg="ffmpeg",
+                ) as normalized:
+                    self.assertEqual(normalized.read_bytes(), b"normalized")
+                    self.assertNotEqual(normalized, source)
+                    self.assertIn("pcm_f32le", calls[1])
+                    self.assertIn("24000", calls[1])
+
+            self.assertEqual(source.read_bytes(), b"original")
+            self.assertEqual(list(Path(directory).iterdir()), [source])
+
+    def test_rejects_silent_reference_measurement(self):
+        silent = dict(self.measurements, input_i="-inf")
+        with self.assertRaisesRegex(RuntimeError, "silent or too quiet"):
+            reference_loudness_filter(silent)
 
 
 class InternalPauseLimitingTests(unittest.TestCase):

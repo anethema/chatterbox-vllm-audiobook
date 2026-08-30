@@ -162,6 +162,8 @@ Larger batches can improve GPU throughput but increase peak resource use. Diffus
 
 Opening another browser tab does not load another model copy; every tab uses the same server process and model. Do not start overlapping text and EPUB jobs, because separate Gradio events can contend for the same GPU, CPU, and RAM and may make a long conversion appear stalled.
 
+Uploaded voice references are normalized from a temporary copy to -20 LUFS with a -3 dBTP ceiling before voice conditioning. The original reference file is not changed. The two-pass linear normalization preserves dynamics when the target can be reached without exceeding the peak ceiling.
+
 ## Output files
 
 Each conversion creates a timestamped folder beneath <code>audiobook_outputs/</code>:

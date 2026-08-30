@@ -1,7 +1,13 @@
+from contextlib import contextmanager
+import json
+import math
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
+import tempfile
+from typing import Iterator, Mapping
 from uuid import uuid4
 import wave
 
@@ -10,6 +16,8 @@ import numpy as np
 
 TARGET_LUFS = -18.0
 TRUE_PEAK_DBTP = -2.0
+REFERENCE_TARGET_LUFS = -20.0
+REFERENCE_TRUE_PEAK_DBTP = -3.0
 LOUDNESS_RANGE_LU = 7.0
 MAX_INTERNAL_PAUSE_SECONDS = 0.5
 INTERNAL_PAUSE_THRESHOLD_DBFS = -50.0
@@ -24,6 +32,115 @@ def loudness_filter() -> str:
         f"loudnorm=I={TARGET_LUFS:g}:TP={TRUE_PEAK_DBTP:g}:"
         f"LRA={LOUDNESS_RANGE_LU:g}"
     )
+
+
+def reference_loudness_filter(
+    measurements: Mapping[str, str] | None = None,
+) -> str:
+    """Return the two-pass EBU R128 filter used for voice references."""
+
+    base = (
+        f"loudnorm=I={REFERENCE_TARGET_LUFS:g}:"
+        f"TP={REFERENCE_TRUE_PEAK_DBTP:g}:LRA={LOUDNESS_RANGE_LU:g}"
+    )
+    if measurements is None:
+        return f"aformat=channel_layouts=mono,{base}:print_format=json"
+
+    fields = {
+        "measured_I": measurements["input_i"],
+        "measured_LRA": measurements["input_lra"],
+        "measured_TP": measurements["input_tp"],
+        "measured_thresh": measurements["input_thresh"],
+        "offset": measurements["target_offset"],
+    }
+    if not all(math.isfinite(float(value)) for value in fields.values()):
+        raise RuntimeError(
+            "Reference audio is silent or too quiet for loudness normalization"
+        )
+    measured = ":".join(f"{key}={value}" for key, value in fields.items())
+    return f"aformat=channel_layouts=mono,{base}:{measured}:linear=true"
+
+
+def _parse_loudness_measurements(stderr: str) -> dict[str, str]:
+    match = re.search(r'\{\s*"input_i".*?\}', stderr, flags=re.DOTALL)
+    if not match:
+        raise RuntimeError("FFmpeg did not report reference-audio loudness")
+    try:
+        measurements = json.loads(match.group(0))
+        reference_loudness_filter(measurements)
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise RuntimeError("FFmpeg reported invalid reference-audio loudness") from error
+    return measurements
+
+
+@contextmanager
+def normalized_reference_audio(
+    path: str | Path,
+    sample_rate: int,
+    *,
+    ffmpeg: str | None = None,
+) -> Iterator[Path]:
+    """Yield a normalized temporary WAV without modifying the voice sample."""
+
+    source = Path(path)
+    ffmpeg = ffmpeg or shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("FFmpeg is required to normalize reference audio")
+
+    measurement_command = [
+        ffmpeg,
+        "-nostdin",
+        "-hide_banner",
+        "-i",
+        str(source),
+        "-af",
+        reference_loudness_filter(),
+        "-f",
+        "null",
+        "-",
+    ]
+    measured = subprocess.run(
+        measurement_command,
+        capture_output=True,
+        text=True,
+    )
+    if measured.returncode != 0:
+        detail = measured.stderr.strip() or "unknown FFmpeg error"
+        raise RuntimeError(f"FFmpeg failed to measure reference audio: {detail}")
+    measurements = _parse_loudness_measurements(measured.stderr)
+
+    with tempfile.TemporaryDirectory(prefix="chatterbox-reference-") as directory:
+        normalized = Path(directory) / "normalized-reference.wav"
+        normalization_command = [
+            ffmpeg,
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(source),
+            "-af",
+            reference_loudness_filter(measurements),
+            "-ar",
+            str(int(sample_rate)),
+            "-ac",
+            "1",
+            "-c:a",
+            "pcm_f32le",
+            str(normalized),
+        ]
+        result = subprocess.run(
+            normalization_command,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            detail = result.stderr.strip() or "unknown FFmpeg error"
+            raise RuntimeError(f"FFmpeg failed to normalize reference audio: {detail}")
+        if not normalized.is_file() or normalized.stat().st_size == 0:
+            raise RuntimeError("FFmpeg did not produce normalized reference audio")
+        yield normalized
 
 
 def normalize_speech_wav(

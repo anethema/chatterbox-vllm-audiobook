@@ -19,6 +19,7 @@ from chatterbox_vllm.models.t3.modules.t3_config import T3Config
 from .models.s3tokenizer import S3_SR, S3_TOKEN_RATE, drop_invalid_tokens
 from .models.s3gen import S3GEN_SR, S3Gen
 from .models.voice_encoder import VoiceEncoder
+from .audio import normalized_reference_audio
 from .models.t3 import SPEECH_TOKEN_OFFSET
 from .models.t3.modules.cond_enc import T3Cond, T3CondEnc
 from .models.t3.modules.learned_pos_emb import LearnedPositionEmbeddings
@@ -285,8 +286,10 @@ class ChatterboxTTS:
             t3_cond_prompt_tokens = self.default_conds.t3.cond_prompt_speech_tokens
             ve_embed = self.default_conds.t3.speaker_emb
         else:
-            ## Load reference wav
-            s3gen_ref_wav, _sr = librosa.load(wav_fpath, sr=S3GEN_SR)
+            # Normalize a temporary copy before deriving every reference
+            # feature. The uploaded/project source is never modified.
+            with normalized_reference_audio(wav_fpath, S3GEN_SR) as normalized:
+                s3gen_ref_wav, _sr = librosa.load(normalized, sr=S3GEN_SR)
             ref_16k_wav = librosa.resample(s3gen_ref_wav, orig_sr=S3GEN_SR, target_sr=S3_SR)
 
             s3gen_ref_wav = s3gen_ref_wav[:self.DEC_COND_LEN]
