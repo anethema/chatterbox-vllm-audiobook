@@ -66,6 +66,8 @@ MAX_PENDING_AUDIO_TASKS = AUDIO_WORKERS * 16
 MEMORY_CLEANUP_BATCHES = 64
 MEMORY_CLEANUP_HEADROOM = 4 * 1024 ** 3
 MINIMUM_MEMORY_HEADROOM = 2 * 1024 ** 3
+DEFAULT_BATCH_SIZE = 32
+MAX_BATCH_SIZE = 64
 
 config_seed = None
 global_model = None
@@ -778,7 +780,7 @@ with gr.Blocks(title="Chatterbox vLLM Audiobook") as demo:
                         label="Maximum characters per speech chunk",
                     )
                     batch_size = gr.Slider(
-                        1, 32, step=1, value=16,
+                        1, MAX_BATCH_SIZE, step=1, value=DEFAULT_BATCH_SIZE,
                         label="vLLM batch size",
                     )
                 epub_info = gr.Markdown(

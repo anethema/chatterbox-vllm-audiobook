@@ -154,7 +154,7 @@ Current UI defaults:
 | Top-P | 1.0 |
 | Repetition penalty | 1.2 |
 | Maximum chunk length | 280 characters |
-| vLLM batch size | 16 |
+| vLLM batch size | 32 (maximum 64) |
 | Loudness target | -18 LUFS |
 | V3 maximum internal pause | 500 ms |
 
