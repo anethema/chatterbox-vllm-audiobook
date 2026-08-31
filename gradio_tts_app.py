@@ -102,7 +102,11 @@ class MemoryPressureError(RuntimeError):
     pass
 
 
-class GeneratedAudioQualityError(ValueError):
+class GeneratedAudioValidationError(ValueError):
+    """The model returned a waveform that cannot safely be saved."""
+
+
+class GeneratedAudioQualityError(GeneratedAudioValidationError):
     def __init__(self, issues):
         self.issues = tuple(issues)
         super().__init__(format_audio_quality_issues(list(self.issues)))
@@ -113,6 +117,14 @@ class RecoveredWaveform:
     waveform: torch.Tensor
     detected_quality_issues: bool
     retained_quality_issues: tuple[AudioQualityIssue, ...]
+    retained_with_warning: bool = False
+
+
+@dataclass(frozen=True)
+class RecoveredSplitPart:
+    waveform: torch.Tensor
+    retained_quality_issues: tuple[AudioQualityIssue, ...]
+    retained_with_warning: bool = False
 
 
 def _quality_log(message: str, *, color: str | None = None) -> None:
@@ -393,22 +405,33 @@ def _waveform_for_save(
 ) -> torch.Tensor:
     if hasattr(waveform, "detach"):
         waveform = waveform.detach()
-    tensor = torch.as_tensor(waveform).to(dtype=torch.float32, device="cpu")
+    try:
+        tensor = torch.as_tensor(waveform).to(dtype=torch.float32, device="cpu")
+    except (TypeError, ValueError, RuntimeError) as error:
+        raise GeneratedAudioValidationError(
+            "The model returned a waveform that could not be converted to audio"
+        ) from error
     if tensor.ndim == 1:
         tensor = tensor.unsqueeze(0)
     elif tensor.ndim == 2 and tensor.shape[1] == 1:
         tensor = tensor.transpose(0, 1)
     if tensor.ndim != 2 or tensor.shape[0] != 1 or tensor.shape[1] == 0:
-        raise ValueError("The model returned an empty or non-mono waveform")
+        raise GeneratedAudioValidationError(
+            "The model returned an empty or non-mono waveform"
+        )
     if not torch.isfinite(tensor).all():
-        raise ValueError("The model returned NaN or infinite audio")
+        raise GeneratedAudioValidationError("The model returned NaN or infinite audio")
 
     duration = tensor.shape[1] / sample_rate
     words = max(1, len(text.split()))
     if duration < min(0.25, 0.04 * words):
-        raise ValueError(f"Generated audio is truncated ({duration:.2f}s for {words} words)")
+        raise GeneratedAudioValidationError(
+            f"Generated audio is truncated ({duration:.2f}s for {words} words)"
+        )
     if duration > 15.0 + 5.0 * words:
-        raise ValueError(f"Generated audio is implausibly long ({duration:.1f}s for {words} words)")
+        raise GeneratedAudioValidationError(
+            f"Generated audio is implausibly long ({duration:.1f}s for {words} words)"
+        )
     issues = find_generated_audio_issues(
         tensor.numpy(),
         sample_rate,
@@ -456,14 +479,57 @@ def _join_split_waveforms(
     return torch.cat(joined, dim=1)
 
 
+def _quality_issues_from_error(
+    error: GeneratedAudioValidationError | None,
+) -> tuple[AudioQualityIssue, ...]:
+    if isinstance(error, GeneratedAudioQualityError):
+        return tuple(error.issues)
+    return ()
+
+
+def _silence_waveform(text: str, sample_rate: int) -> torch.Tensor:
+    """Return a short, valid placeholder when every model result is unusable."""
+
+    words = max(1, len(text.split()))
+    duration = min(3.0, max(0.25, 0.16 * words))
+    return torch.zeros(
+        (1, max(1, round(sample_rate * duration))),
+        dtype=torch.float32,
+    )
+
+
+def _best_effort_waveform(
+    audio,
+    text: str,
+    sample_rate: int,
+    label: str,
+) -> tuple[torch.Tensor, bool]:
+    """Retain scan-only issues, but never retain a structurally invalid waveform."""
+
+    try:
+        return _waveform_for_save(
+            audio,
+            text,
+            sample_rate,
+            allow_quality_issues=True,
+        ), False
+    except GeneratedAudioValidationError as error:
+        _quality_log(
+            f"[Audio quality warning] {label}: {error}; using a short silent "
+            "fallback so generation can continue",
+            color="red",
+        )
+        return _silence_waveform(text, sample_rate), True
+
+
 def _recover_split_part(
     text: str,
     sample_rate: int,
     label: str,
     generate_part,
     depth: int,
-) -> torch.Tensor:
-    last_error = None
+) -> RecoveredSplitPart:
+    last_error: GeneratedAudioValidationError | None = None
     last_audio = None
     for attempt in range(MAX_SPLIT_PART_ATTEMPTS):
         audio = generate_part(text)
@@ -475,8 +541,8 @@ def _recover_split_part(
                 "full-waveform scan",
                 color="green",
             )
-            return waveform
-        except GeneratedAudioQualityError as error:
+            return RecoveredSplitPart(waveform, ())
+        except GeneratedAudioValidationError as error:
             last_error = error
             _quality_log(
                 f"[Audio quality scan] {label}: found {error}",
@@ -493,14 +559,20 @@ def _recover_split_part(
     if len(split_sentences(text)) <= 1:
         _quality_log(
             f"[Audio quality warning] {label}: single-sentence audio still has "
-            f"{last_error}; included anyway so generation can continue",
+            f"{last_error}; using bounded best-effort recovery; included anyway "
+            "so generation can continue",
             color="red",
         )
-        return _waveform_for_save(
+        waveform, _ = _best_effort_waveform(
             last_audio,
             text,
             sample_rate,
-            allow_quality_issues=True,
+            label,
+        )
+        return RecoveredSplitPart(
+            waveform,
+            _quality_issues_from_error(last_error),
+            True,
         )
 
     nested_parts = split_text_for_recovery(text)
@@ -513,14 +585,20 @@ def _recover_split_part(
         detail = str(last_error) if last_error is not None else "unknown audio issue"
         _quality_log(
             f"[Audio quality warning] {label}: reached the bounded split limit "
-            f"with {detail}; included anyway so generation can continue",
+            f"with {detail}; using bounded best-effort recovery; included anyway "
+            "so generation can continue",
             color="red",
         )
-        return _waveform_for_save(
+        waveform, _ = _best_effort_waveform(
             last_audio,
             text,
             sample_rate,
-            allow_quality_issues=True,
+            label,
+        )
+        return RecoveredSplitPart(
+            waveform,
+            _quality_issues_from_error(last_error),
+            True,
         )
 
     _quality_log(
@@ -539,16 +617,33 @@ def _recover_split_part(
         )
         for index, nested in enumerate(nested_parts)
     ]
-    combined = _join_split_waveforms(recovered, sample_rate)
+    combined = _join_split_waveforms(
+        [part.waveform for part in recovered],
+        sample_rate,
+    )
     issues = find_generated_audio_issues(combined.numpy(), sample_rate)
+    retained_quality_issues = tuple(
+        issue
+        for part in recovered
+        for issue in part.retained_quality_issues
+    )
+    retained_with_warning = any(
+        part.retained_with_warning for part in recovered
+    )
     if issues:
+        retained_quality_issues += tuple(issues)
+        retained_with_warning = True
         _quality_log(
             f"[Audio quality warning] {label}: recursively split output retains "
             f"{format_audio_quality_issues(issues)}; included anyway so generation "
             "can continue",
             color="red",
         )
-    return combined
+    return RecoveredSplitPart(
+        combined,
+        retained_quality_issues,
+        retained_with_warning,
+    )
 
 
 def _recover_generated_waveform(
@@ -565,7 +660,7 @@ def _recover_generated_waveform(
             False,
             (),
         )
-    except GeneratedAudioQualityError as error:
+    except GeneratedAudioValidationError as error:
         _quality_log(
             f"[Audio quality scan] {label}: found {error}",
             color="red",
@@ -577,7 +672,7 @@ def _recover_generated_waveform(
         color="yellow",
     )
     retried_audio = regenerate_whole()
-    retry_failure = None
+    retry_failure: GeneratedAudioValidationError | None = None
     try:
         waveform = _waveform_for_save(retried_audio, text, sample_rate)
         _quality_log(
@@ -586,7 +681,7 @@ def _recover_generated_waveform(
             color="green",
         )
         return RecoveredWaveform(waveform, True, ())
-    except GeneratedAudioQualityError as retry_error:
+    except GeneratedAudioValidationError as retry_error:
         retry_failure = retry_error
         _quality_log(
             f"[Audio quality scan] {label}: whole-chunk replacement also "
@@ -598,18 +693,21 @@ def _recover_generated_waveform(
     if len(split_sentences(text)) <= 1 or len(parts) < 2:
         _quality_log(
             f"[Audio quality warning] {label}: single-sentence audio still has "
-            f"{retry_failure}; included anyway so generation can continue",
+            f"{retry_failure}; using bounded best-effort recovery; included anyway "
+            "so generation can continue",
             color="red",
         )
+        waveform, _ = _best_effort_waveform(
+            retried_audio,
+            text,
+            sample_rate,
+            label,
+        )
         return RecoveredWaveform(
-            _waveform_for_save(
-                retried_audio,
-                text,
-                sample_rate,
-                allow_quality_issues=True,
-            ),
+            waveform,
             True,
-            tuple(retry_failure.issues),
+            _quality_issues_from_error(retry_failure),
+            True,
         )
     _quality_log(
         f"[Audio quality repair] {label}: splitting repeatedly failed text "
@@ -628,24 +726,45 @@ def _recover_generated_waveform(
         for part_index, part in enumerate(parts)
     ]
 
-    combined = _join_split_waveforms(part_waveforms, sample_rate)
-    retained_quality_issues = ()
+    combined = _join_split_waveforms(
+        [part.waveform for part in part_waveforms],
+        sample_rate,
+    )
+    retained_quality_issues = tuple(
+        issue
+        for part in part_waveforms
+        for issue in part.retained_quality_issues
+    )
+    retained_with_warning = any(
+        part.retained_with_warning for part in part_waveforms
+    )
     try:
         result = _waveform_for_save(combined, text, sample_rate)
-    except GeneratedAudioQualityError as combined_error:
-        retained_quality_issues = tuple(combined_error.issues)
-        _quality_log(
-            f"[Audio quality warning] {label}: combined sentence-sized output "
-            f"retains {combined_error}; included anyway so generation can continue",
-            color="red",
-        )
-        result = _waveform_for_save(
+    except GeneratedAudioValidationError as combined_error:
+        retained_quality_issues += _quality_issues_from_error(combined_error)
+        retained_with_warning = True
+        if isinstance(combined_error, GeneratedAudioQualityError):
+            _quality_log(
+                f"[Audio quality warning] {label}: combined sentence-sized output "
+                f"retains {combined_error}; included anyway so generation can "
+                "continue",
+                color="red",
+            )
+        else:
+            _quality_log(
+                f"[Audio quality warning] {label}: combined sentence-sized output "
+                f"failed validation ({combined_error}); using bounded best-effort "
+                "recovery so generation can continue",
+                color="red",
+            )
+        result, used_silence_fallback = _best_effort_waveform(
             combined,
             text,
             sample_rate,
-            allow_quality_issues=True,
+            label,
         )
-    if not retained_quality_issues:
+        retained_with_warning = retained_with_warning or used_silence_fallback
+    if not retained_with_warning:
         _quality_log(
             f"[Audio quality repair] {label}: fixed with {len(parts)} shorter "
             "parts; combined waveform passed the full scan",
@@ -655,6 +774,7 @@ def _recover_generated_waveform(
         result,
         True,
         retained_quality_issues,
+        retained_with_warning,
     )
 
 
@@ -999,13 +1119,17 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
             )
             repaired_path = chunks_dir / f"{chunk_index:06d}.wav"
             saved_issues = wav_generated_audio_issues(repaired_path, global_model.sr)
-            if saved_issues:
+            if saved_issues or recovery.retained_with_warning:
                 retained_noisy_chunks.append(chunk_index)
                 quality_retained_chunks.add(chunk_index)
                 quality_fixed_chunks.discard(chunk_index)
+                detail = (
+                    format_audio_quality_issues(saved_issues)
+                    if saved_issues
+                    else "bounded recovery retained an invalid-output fallback"
+                )
                 _quality_log(
-                    f"[Audio quality warning] {repaired_path.name}: post-save scan "
-                    f"still found {format_audio_quality_issues(saved_issues)}; "
+                    f"[Audio quality warning] {repaired_path.name}: {detail}; "
                     "included anyway so generation can continue",
                     color="red",
                 )
@@ -1128,10 +1252,9 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
                 )
                 waveform = recovery.waveform
                 initial_quality_issues = recovery.detected_quality_issues
-                final_quality_issues = recovery.retained_quality_issues
                 if initial_quality_issues:
                     quality_detected_chunks.add(chunk_index)
-                if final_quality_issues:
+                if recovery.retained_with_warning:
                     retained_quality_chunks.append(chunk_index)
                     quality_detected_chunks.add(chunk_index)
                     quality_retained_chunks.add(chunk_index)

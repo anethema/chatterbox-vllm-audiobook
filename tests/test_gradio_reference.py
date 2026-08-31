@@ -117,6 +117,97 @@ class AudioRecoveryTests(unittest.TestCase):
         good = self.good_audio().squeeze(0).numpy()
         return torch.from_numpy(np.concatenate([good, noise, good])).unsqueeze(0)
 
+    def truncated_audio(self):
+        # This is the exact duration in the reported "asked Vess." failure.
+        return torch.zeros((1, round(0.04 * self.sample_rate)), dtype=torch.float32)
+
+    def test_two_word_truncation_retries_the_entire_chunk(self):
+        retry_calls = []
+
+        recovery = gradio_tts_app._recover_generated_waveform(
+            self.truncated_audio(),
+            "asked Vess.",
+            self.sample_rate,
+            "chunk 029107",
+            lambda: (retry_calls.append("retry") or self.good_audio()),
+            lambda part: self.good_audio(),
+        )
+
+        self.assertEqual(retry_calls, ["retry"])
+        self.assertTrue(recovery.detected_quality_issues)
+        self.assertFalse(recovery.retained_with_warning)
+        self.assertEqual(recovery.retained_quality_issues, ())
+        self.assertEqual(recovery.waveform.shape, self.good_audio().shape)
+
+    def test_repeated_invalid_single_sentence_output_uses_safe_silence(self):
+        output = io.StringIO()
+        with redirect_stdout(output):
+            recovery = gradio_tts_app._recover_generated_waveform(
+                self.truncated_audio(),
+                "asked Vess.",
+                self.sample_rate,
+                "chunk 029107",
+                self.truncated_audio,
+                self.truncated_audio,
+            )
+
+        self.assertTrue(recovery.detected_quality_issues)
+        self.assertTrue(recovery.retained_with_warning)
+        self.assertEqual(recovery.retained_quality_issues, ())
+        self.assertEqual(recovery.waveform.ndim, 2)
+        self.assertEqual(recovery.waveform.shape[0], 1)
+        self.assertGreater(recovery.waveform.shape[1], 0)
+        self.assertTrue(torch.isfinite(recovery.waveform).all())
+        self.assertEqual(torch.count_nonzero(recovery.waveform), 0)
+        self.assertIn("short silent fallback", output.getvalue())
+
+    def test_empty_and_nonfinite_outputs_cannot_escape_recovery(self):
+        invalid_outputs = {
+            "empty": torch.empty((1, 0), dtype=torch.float32),
+            "nonfinite": torch.full((1, 1000), float("nan")),
+        }
+        for label, invalid_audio in invalid_outputs.items():
+            with self.subTest(label=label), redirect_stdout(io.StringIO()):
+                recovery = gradio_tts_app._recover_generated_waveform(
+                    invalid_audio,
+                    "asked Vess.",
+                    self.sample_rate,
+                    "chunk 029107",
+                    lambda audio=invalid_audio: audio,
+                    lambda part, audio=invalid_audio: audio,
+                )
+
+            self.assertTrue(recovery.detected_quality_issues)
+            self.assertTrue(recovery.retained_with_warning)
+            self.assertEqual(recovery.waveform.shape[0], 1)
+            self.assertGreater(recovery.waveform.shape[1], 0)
+            self.assertTrue(torch.isfinite(recovery.waveform).all())
+
+    def test_invalid_split_outputs_are_retained_without_aborting(self):
+        text = "First short sentence. Second short sentence. Third short sentence."
+        part_calls = []
+
+        def generate_part(part):
+            part_calls.append(part)
+            return self.truncated_audio()
+
+        recovery = gradio_tts_app._recover_generated_waveform(
+            self.truncated_audio(),
+            text,
+            self.sample_rate,
+            "chunk 029108",
+            self.truncated_audio,
+            generate_part,
+        )
+
+        self.assertGreaterEqual(len(part_calls), 2)
+        self.assertTrue(recovery.detected_quality_issues)
+        self.assertTrue(recovery.retained_with_warning)
+        self.assertEqual(recovery.waveform.ndim, 2)
+        self.assertEqual(recovery.waveform.shape[0], 1)
+        self.assertGreater(recovery.waveform.shape[1], 0)
+        self.assertTrue(torch.isfinite(recovery.waveform).all())
+
     def test_whole_chunk_retry_can_recover(self):
         split_calls = []
 
