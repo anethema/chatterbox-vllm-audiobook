@@ -60,11 +60,16 @@ from chatterbox_vllm.projects import (
     ResumeProjectError,
     build_resume_plan,
     contiguous_chunk_count,
+    delete_quality_scan_checkpoint,
     incomplete_project_choices,
+    load_quality_scan_checkpoint,
     load_project_metadata,
     persist_project_inputs,
     project_model_id,
+    quality_scan_checkpoint_entry_matches,
     saved_project_inputs,
+    wav_file_identity,
+    write_quality_scan_checkpoint,
     write_project_progress,
 )
 from chatterbox_vllm.progress import GenerationControl, estimate_progress, format_duration
@@ -87,6 +92,10 @@ MAX_WHOLE_CHUNK_ATTEMPTS = 2
 MAX_SPLIT_PART_ATTEMPTS = 2
 MAX_RECOVERY_SPLIT_DEPTH = 4
 SPLIT_JOIN_SILENCE_SECONDS = 0.12
+RESUME_SCAN_PROGRESS_UPDATE_SECONDS = 1.0
+RESUME_SCAN_PROGRESS_UPDATE_CHUNKS = 100
+QUALITY_SCAN_CHECKPOINT_UPDATE_SECONDS = 30.0
+QUALITY_SCAN_CHECKPOINT_UPDATE_CHUNKS = 1000
 
 config_seed = None
 global_model = None
@@ -127,11 +136,69 @@ class RecoveredSplitPart:
     retained_with_warning: bool = False
 
 
+@dataclass(frozen=True)
+class SavedChunkQuality:
+    """The final on-disk result after deterministic audio transforms."""
+
+    path: Path
+    verified_clean: bool
+
+
 def _quality_log(message: str, *, color: str | None = None) -> None:
     colors = {"red": "\033[1;31m", "green": "\033[1;32m", "yellow": "\033[1;33m"}
     if color in colors and hasattr(sys.stdout, "isatty") and sys.stdout.isatty():
         message = f"{colors[color]}{message}\033[0m"
     print(message, flush=True)
+
+
+def _resume_scan_progress_message(
+    scanned_chunks: int,
+    total_chunks: int,
+    elapsed_seconds: float,
+    *,
+    cached_verified_chunks: int = 0,
+) -> str:
+    """Describe resume validation progress and an estimate of its completion."""
+
+    total = max(0, int(total_chunks))
+    scanned = max(0, min(int(scanned_chunks), total))
+    percent = 100.0 * scanned / total if total else 100.0
+    if total == 0:
+        eta = "ETA 0s"
+    elif scanned:
+        remaining_seconds = (
+            max(0.0, float(elapsed_seconds)) * (total - scanned) / scanned
+        )
+        eta = f"ETA {format_duration(remaining_seconds)}"
+    else:
+        eta = "ETA calculating…"
+    message = (
+        "[Audio quality scan] Scanning existing chunks: "
+        f"{scanned:,}/{total:,} ({percent:.1f}%) — {eta}"
+    )
+    if cached_verified_chunks:
+        message += f" • skipped {cached_verified_chunks:,} cached verified"
+    return message
+
+
+def _report_resume_scan_progress(
+    progress,
+    scanned_chunks: int,
+    total_chunks: int,
+    started_at: float,
+    *,
+    log_stdout: bool = True,
+    cached_verified_chunks: int = 0,
+) -> None:
+    message = _resume_scan_progress_message(
+        scanned_chunks,
+        total_chunks,
+        time.perf_counter() - started_at,
+        cached_verified_chunks=cached_verified_chunks,
+    )
+    progress(scanned_chunks / total_chunks if total_chunks else 1.0, desc=message)
+    if log_stdout:
+        _quality_log(message, color="green")
 
 
 def _log_batch_quality_summary(
@@ -802,6 +869,39 @@ def _save_and_normalize_chunk(
     return path
 
 
+def _save_normalize_and_record_chunk(
+    path: Path,
+    waveform: torch.Tensor,
+    sample_rate: int,
+    ffmpeg: str,
+    maximum_internal_pause_seconds: float | None,
+    *,
+    cacheable: bool,
+) -> SavedChunkQuality:
+    _save_and_normalize_chunk(
+        path,
+        waveform,
+        sample_rate,
+        ffmpeg,
+        maximum_internal_pause_seconds,
+    )
+    return SavedChunkQuality(path=path, verified_clean=cacheable)
+
+
+def _limit_pauses_and_record_chunk(
+    path: Path,
+    sample_rate: int,
+    *,
+    maximum_seconds: float,
+) -> SavedChunkQuality:
+    limit_internal_pauses_wav(
+        path,
+        sample_rate,
+        maximum_seconds=maximum_seconds,
+    )
+    return SavedChunkQuality(path=path, verified_clean=True)
+
+
 def _write_metadata(path: Path, book: EpubBook, source_path: str, chunks: list[TextChunk],
                     settings: dict, completed: int, model_id: str,
                     output_path: str | None = None,
@@ -857,14 +957,35 @@ def _write_metadata(path: Path, book: EpubBook, source_path: str, chunks: list[T
         temporary.unlink(missing_ok=True)
 
 
-def _record_durable_results(audio_tasks, durable_indices: set[int], durable_chunks: int) -> int:
+def _record_durable_results(
+    audio_tasks,
+    durable_indices: set[int],
+    durable_chunks: int,
+    verified_clean_chunks: dict[int, dict[str, int]],
+) -> tuple[int, int]:
+    """Record completed background output and cache only verified final WAVs."""
+
+    checkpoint_change_count = 0
     audio_tasks.check()
-    for path in audio_tasks.take_results():
+    for result in audio_tasks.take_results():
+        if not isinstance(result, SavedChunkQuality):
+            raise RuntimeError("Background audio task returned an unexpected result")
+        path = result.path
+        chunk_index = int(path.stem)
         durable_indices.add(int(Path(path).stem))
+        identity = wav_file_identity(path)
+        if result.verified_clean and identity is not None:
+            if verified_clean_chunks.get(chunk_index) != identity:
+                verified_clean_chunks[chunk_index] = identity
+                checkpoint_change_count += 1
+        else:
+            if chunk_index in verified_clean_chunks:
+                verified_clean_chunks.pop(chunk_index, None)
+                checkpoint_change_count += 1
     while durable_chunks in durable_indices:
         durable_indices.remove(durable_chunks)
         durable_chunks += 1
-    return durable_chunks
+    return durable_chunks, checkpoint_change_count
 
 
 def _protect_system_memory(batch_number: int) -> None:
@@ -915,6 +1036,7 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
     durable_chunks = 0
     durable_indices = set()
     audio_tasks = None
+    persist_quality_scan_checkpoint = None
     active_project_model_id = global_model.model_id
     generation_control.begin()
     try:
@@ -1007,12 +1129,95 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
         quality_detected_chunks: set[int] = set()
         quality_fixed_chunks: set[int] = set()
         quality_retained_chunks: set[int] = set()
+        verified_clean_chunks = load_quality_scan_checkpoint(project_dir)
+        stale_checkpoint_indices = [
+            chunk_index
+            for chunk_index in verified_clean_chunks
+            if chunk_index >= durable_chunks
+        ]
+        for chunk_index in stale_checkpoint_indices:
+            if chunk_index >= durable_chunks:
+                verified_clean_chunks.pop(chunk_index)
+        checkpoint_dirty_chunks = len(stale_checkpoint_indices)
+        checkpoint_last_saved_at = time.monotonic()
+
+        def persist_quality_scan_checkpoint(*, force: bool = False) -> None:
+            """Avoid frequent large metadata rewrites while preserving scan work."""
+
+            nonlocal checkpoint_dirty_chunks, checkpoint_last_saved_at
+            if not checkpoint_dirty_chunks:
+                return
+            now = time.monotonic()
+            if (
+                not force
+                and checkpoint_dirty_chunks < QUALITY_SCAN_CHECKPOINT_UPDATE_CHUNKS
+                and now - checkpoint_last_saved_at
+                < QUALITY_SCAN_CHECKPOINT_UPDATE_SECONDS
+            ):
+                return
+            write_quality_scan_checkpoint(project_dir, verified_clean_chunks)
+            checkpoint_dirty_chunks = 0
+            checkpoint_last_saved_at = now
+
         if resuming:
-            for chunk_index in range(durable_chunks):
+            scan_indices = [
+                chunk_index
+                for chunk_index in range(durable_chunks)
+                if not quality_scan_checkpoint_entry_matches(
+                    verified_clean_chunks,
+                    chunk_index,
+                    chunks_dir / f"{chunk_index:06d}.wav",
+                )
+            ]
+            cached_verified_chunks = durable_chunks - len(scan_indices)
+            scan_started = time.perf_counter()
+            last_scan_report_at = scan_started
+            last_logged_scan_count = 0
+            _report_resume_scan_progress(
+                progress,
+                0,
+                len(scan_indices),
+                scan_started,
+                cached_verified_chunks=cached_verified_chunks,
+            )
+            for scanned_chunks, chunk_index in enumerate(scan_indices, start=1):
                 chunk_path = chunks_dir / f"{chunk_index:06d}.wav"
                 issues = wav_generated_audio_issues(chunk_path, global_model.sr)
                 if issues:
                     damaged_chunks[chunk_index] = issues
+                    if chunk_index in verified_clean_chunks:
+                        verified_clean_chunks.pop(chunk_index)
+                        checkpoint_dirty_chunks += 1
+                else:
+                    identity = wav_file_identity(chunk_path)
+                    if identity is not None and verified_clean_chunks.get(chunk_index) != identity:
+                        verified_clean_chunks[chunk_index] = identity
+                        checkpoint_dirty_chunks += 1
+                persist_quality_scan_checkpoint()
+                now = time.perf_counter()
+                should_update_progress = (
+                    scanned_chunks == len(scan_indices)
+                    or now - last_scan_report_at
+                    >= RESUME_SCAN_PROGRESS_UPDATE_SECONDS
+                )
+                should_log = (
+                    scanned_chunks == len(scan_indices)
+                    or scanned_chunks - last_logged_scan_count
+                    >= RESUME_SCAN_PROGRESS_UPDATE_CHUNKS
+                )
+                if should_update_progress or should_log:
+                    _report_resume_scan_progress(
+                        progress,
+                        scanned_chunks,
+                        len(scan_indices),
+                        scan_started,
+                        log_stdout=should_log,
+                        cached_verified_chunks=cached_verified_chunks,
+                    )
+                    last_scan_report_at = now
+                    if should_log:
+                        last_logged_scan_count = scanned_chunks
+            persist_quality_scan_checkpoint(force=True)
             quality_detected_chunks.update(damaged_chunks)
             labels = (
                 ", ".join(f"{index:06d}.wav" for index in damaged_chunks)
@@ -1020,8 +1225,9 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
                 else "none"
             )
             _quality_log(
-                f"[Audio quality scan] Scanned {durable_chunks:,} existing "
-                f"chunk(s); found {len(damaged_chunks):,} damaged: {labels}",
+                f"[Audio quality scan] Scanned {len(scan_indices):,} existing "
+                f"chunk(s); skipped {cached_verified_chunks:,} cached verified; "
+                f"found {len(damaged_chunks):,} damaged: {labels}",
                 color="red" if damaged_chunks else None,
             )
             for chunk_index, issues in damaged_chunks.items():
@@ -1120,6 +1326,9 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
             repaired_path = chunks_dir / f"{chunk_index:06d}.wav"
             saved_issues = wav_generated_audio_issues(repaired_path, global_model.sr)
             if saved_issues or recovery.retained_with_warning:
+                if chunk_index in verified_clean_chunks:
+                    verified_clean_chunks.pop(chunk_index)
+                    checkpoint_dirty_chunks += 1
                 retained_noisy_chunks.append(chunk_index)
                 quality_retained_chunks.add(chunk_index)
                 quality_fixed_chunks.discard(chunk_index)
@@ -1134,13 +1343,18 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
                     color="red",
                 )
             repaired_chunks.append(chunk_index)
-            if not saved_issues:
+            if not saved_issues and not recovery.retained_with_warning:
+                identity = wav_file_identity(repaired_path)
+                if identity is not None and verified_clean_chunks.get(chunk_index) != identity:
+                    verified_clean_chunks[chunk_index] = identity
+                    checkpoint_dirty_chunks += 1
                 quality_fixed_chunks.add(chunk_index)
                 quality_retained_chunks.discard(chunk_index)
                 _quality_log(
                     f"[Audio quality repair] Fixed and verified {chunk_index:06d}.wav",
                     color="green",
                 )
+        persist_quality_scan_checkpoint(force=True)
         if resuming:
             fixed_chunks = [
                 index for index in repaired_chunks
@@ -1177,7 +1391,7 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
                 if chunk_index in damaged_chunks:
                     continue
                 audio_tasks.submit(
-                    limit_internal_pauses_wav,
+                    _limit_pauses_and_record_chunk,
                     chunks_dir / f"{chunk_index:06d}.wav",
                     global_model.sr,
                     maximum_seconds=maximum_internal_pause_seconds,
@@ -1219,9 +1433,15 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
                 cond_emb=cond_emb,
                 **batch_args,
             )
-            durable_chunks = _record_durable_results(
-                audio_tasks, durable_indices, durable_chunks,
+            durable_chunks, checkpoint_change_count = _record_durable_results(
+                audio_tasks,
+                durable_indices,
+                durable_chunks,
+                verified_clean_chunks,
             )
+            if checkpoint_change_count:
+                checkpoint_dirty_chunks += checkpoint_change_count
+                persist_quality_scan_checkpoint()
             if len(audios) != len(batch):
                 raise RuntimeError(f"Model returned {len(audios)} outputs for a batch of {len(batch)}")
             retained_quality_chunks = []
@@ -1266,12 +1486,13 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
                 completed_characters += len(chunk.text)
                 chunk_path = chunks_dir / f"{chunk_index:06d}.wav"
                 audio_tasks.submit(
-                    _save_and_normalize_chunk,
+                    _save_normalize_and_record_chunk,
                     chunk_path,
                     waveform,
                     global_model.sr,
                     ffmpeg,
                     maximum_internal_pause_seconds,
+                    cacheable=not recovery.retained_with_warning,
                 )
             _log_batch_quality_summary(
                 start,
@@ -1279,9 +1500,15 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
                 retained_quality_chunks,
             )
             completed_chunks = start + len(batch)
-            durable_chunks = _record_durable_results(
-                audio_tasks, durable_indices, durable_chunks,
+            durable_chunks, checkpoint_change_count = _record_durable_results(
+                audio_tasks,
+                durable_indices,
+                durable_chunks,
+                verified_clean_chunks,
             )
+            if checkpoint_change_count:
+                checkpoint_dirty_chunks += checkpoint_change_count
+                persist_quality_scan_checkpoint()
             write_project_progress(project_dir, durable_chunks, completed_chunks)
             elapsed = time.perf_counter() - generation_started
             estimate = estimate_progress(
@@ -1304,11 +1531,16 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
         if audio_tasks is not None:
             progress(0.975, desc="Finishing background audio processing")
             audio_tasks.finish()
-            for path in audio_tasks.take_results():
-                durable_indices.add(int(Path(path).stem))
-            while durable_chunks in durable_indices:
-                durable_chunks += 1
+            durable_chunks, checkpoint_change_count = _record_durable_results(
+                audio_tasks,
+                durable_indices,
+                durable_chunks,
+                verified_clean_chunks,
+            )
+            if checkpoint_change_count:
+                checkpoint_dirty_chunks += checkpoint_change_count
             audio_tasks = None
+        persist_quality_scan_checkpoint(force=True)
         _log_project_quality_summary(
             len(chunks),
             quality_detected_chunks,
@@ -1363,6 +1595,7 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
             chunks_available=False,
         )
         (project_dir / "progress.json").unlink(missing_ok=True)
+        delete_quality_scan_checkpoint(project_dir)
         generation_elapsed = time.perf_counter() - generation_started
         final_speed = final_audio_seconds / max(generation_elapsed, 1e-9)
         progress(1, desc="Audiobook complete")
@@ -1416,6 +1649,11 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
     finally:
         if audio_tasks is not None:
             audio_tasks.cancel_and_wait()
+        if persist_quality_scan_checkpoint is not None:
+            try:
+                persist_quality_scan_checkpoint(force=True)
+            except Exception:
+                traceback.print_exc()
         generation_control.finish()
 
 
