@@ -87,7 +87,7 @@ The installer:
 
 It does not install or modify the NVIDIA driver.
 
-### Manual installation
+### Manual installation with uv
 
 ~~~bash
 sudo apt update
@@ -100,6 +100,26 @@ git clone https://github.com/anethema/chatterbox-vllm-audiobook.git
 cd chatterbox-vllm-audiobook
 uv sync --locked --python 3.12
 ~~~
+
+### Manual installation with pip
+
+For users who already have Python 3.12 and prefer a conventional virtual environment, <code>requirements.txt</code> is generated from <code>uv.lock</code> and pins the same runtime dependency versions:
+
+~~~bash
+sudo apt update
+sudo apt install -y git curl ffmpeg
+
+git clone https://github.com/anethema/chatterbox-vllm-audiobook.git
+cd chatterbox-vllm-audiobook
+
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python -m pip install --no-deps -e .
+~~~
+
+The final editable install adds this project without asking pip to resolve the dependency graph a second time. Do not install the package first without <code>--no-deps</code>, because that would ignore the exact transitive versions exported from the lockfile. The pip path still requires Linux or WSL2, a working NVIDIA driver, FFmpeg, and FFprobe.
 
 Verify the environment:
 
@@ -254,6 +274,12 @@ git pull --ff-only origin master
 ~~~
 
 Rerunning the installer is safe and synchronizes <code>.venv</code> to the updated lockfile. Model files already present in the Hugging Face cache are reused.
+
+The committed <code>requirements.txt</code> is a generated pip compatibility file. When dependencies change, regenerate it from the validated lockfile instead of editing it manually:
+
+~~~bash
+uv export --locked --no-dev --no-emit-project --no-hashes --format requirements.txt --output-file requirements.txt
+~~~
 
 Development changes are prepared on feature branches and merged into <code>master</code> after testing.
 
