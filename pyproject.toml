@@ -24,13 +24,18 @@ dependencies = [
     "omegaconf",
     "conformer",
     "diffusers",
-    "vllm",
     "peft",
     "llvmlite>=0.44.0",
     "vllm==0.10.0",
     "gradio",
     "spacy-pkuseg",
     "pykakasi",
+    "silero-vad",
+    "pyrnnoise>=0.4.3,<0.5",
+    # pyrnnoise 0.4.3 still uses the pre-0.5 audiolab API, whose PyAV adapter
+    # in turn imports av.option (removed in PyAV 16).
+    "audiolab==0.4.9",
+    "av==15.1.0",
 ]
 
 [project.optional-dependencies]

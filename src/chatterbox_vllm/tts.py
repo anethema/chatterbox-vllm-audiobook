@@ -19,10 +19,11 @@ from chatterbox_vllm.models.t3.modules.t3_config import T3Config
 from .models.s3tokenizer import S3_SR, S3_TOKEN_RATE, drop_invalid_tokens
 from .models.s3gen import S3GEN_SR, S3Gen
 from .models.voice_encoder import VoiceEncoder
+from .audio import prepared_reference_audio
 from .models.t3 import SPEECH_TOKEN_OFFSET
 from .models.t3.modules.cond_enc import T3Cond, T3CondEnc
 from .models.t3.modules.learned_pos_emb import LearnedPositionEmbeddings
-from .text_utils import punc_norm, SUPPORTED_LANGUAGES
+from .text_utils import prepare_tts_text, SUPPORTED_LANGUAGES
 from .model_variants import (
     ENGLISH_V1_MODEL_ID,
     MULTILINGUAL_CHECKPOINTS,
@@ -279,14 +280,24 @@ class ChatterboxTTS:
             return { "en": "English" }
 
     @lru_cache(maxsize=10)
-    def get_audio_conditionals(self, wav_fpath: Optional[str] = None) -> Tuple[dict[str, Any], torch.Tensor]:
+    def get_audio_conditionals(
+        self,
+        wav_fpath: Optional[str] = None,
+        denoise_reference: bool = False,
+    ) -> Tuple[dict[str, Any], torch.Tensor]:
         if wav_fpath is None:
             s3gen_ref_dict = self.default_conds.gen
             t3_cond_prompt_tokens = self.default_conds.t3.cond_prompt_speech_tokens
             ve_embed = self.default_conds.t3.speaker_emb
         else:
-            ## Load reference wav
-            s3gen_ref_wav, _sr = librosa.load(wav_fpath, sr=S3GEN_SR)
+            # Prepare a temporary copy before deriving every reference feature.
+            # The uploaded/project source is never modified.
+            with prepared_reference_audio(
+                wav_fpath,
+                S3GEN_SR,
+                denoise=denoise_reference,
+            ) as normalized:
+                s3gen_ref_wav, _sr = librosa.load(normalized, sr=S3GEN_SR)
             ref_16k_wav = librosa.resample(s3gen_ref_wav, orig_sr=S3GEN_SR, target_sr=S3_SR)
 
             s3gen_ref_wav = s3gen_ref_wav[:self.DEC_COND_LEN]
@@ -335,11 +346,15 @@ class ChatterboxTTS:
         top_p=0.8,
         repetition_penalty=1.2,
         cfg_weight: float | None = None,
+        denoise_reference: bool = False,
 
         # Supports anything in https://docs.vllm.ai/en/v0.9.2/api/vllm/index.html?h=samplingparams#vllm.SamplingParams
         *args, **kwargs,
     ) -> list[any]:
-        s3gen_ref, cond_emb = self.get_audio_conditionals(audio_prompt_path)
+        s3gen_ref, cond_emb = self.get_audio_conditionals(
+            audio_prompt_path,
+            denoise_reference=denoise_reference,
+        )
 
         return self.generate_with_conds(
             prompts=prompts,
@@ -399,8 +414,31 @@ class ChatterboxTTS:
         if not 0.0 <= cfg_weight <= 1.0:
             raise ValueError("cfg_weight must be between 0.0 and 1.0")
 
-        # Norm and tokenize text
-        prompts = ["[START]" + punc_norm(p) + "[STOP]" for p in prompts]
+        # Clean only the transient inference prompts.  EPUB chunks and project
+        # metadata retain their original source text for resumes and auditing.
+        cleaned_prompts = []
+        cleanup_counts = {}
+        changed_prompt_count = 0
+        for prompt in prompts:
+            cleaned_prompt, changes = prepare_tts_text(prompt)
+            cleaned_prompts.append(cleaned_prompt)
+            if changes:
+                changed_prompt_count += 1
+                for category, count in changes.items():
+                    cleanup_counts[category] = cleanup_counts.get(category, 0) + count
+        if changed_prompt_count:
+            details = ", ".join(
+                f"{category}={count}"
+                for category, count in sorted(cleanup_counts.items())
+            )
+            print(
+                "[Text cleanup] Batch: "
+                f"{changed_prompt_count}/{len(prompts)} prompts changed ({details})",
+                flush=True,
+            )
+
+        # Add control tokens only after the user/book text is cleaned.
+        prompts = ["[START]" + prompt + "[STOP]" for prompt in cleaned_prompts]
 
         # For multilingual, prepend the language token
         if self.variant == "multilingual":
@@ -431,6 +469,7 @@ class ChatterboxTTS:
                         stop_token_ids=[self.t3_config.stop_speech_token + SPEECH_TOKEN_OFFSET],
                         max_tokens=min(max_tokens, self.max_model_len),
                         top_p=top_p,
+                        min_p=min_p,
                         repetition_penalty=repetition_penalty,
                         *args, **kwargs,
                     )

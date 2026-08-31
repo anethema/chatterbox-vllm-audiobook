@@ -1,20 +1,58 @@
+from contextlib import contextmanager
+from dataclasses import dataclass
+import json
+import math
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
+import tempfile
+import time
+from typing import Iterator, Mapping
 from uuid import uuid4
 import wave
 
 import numpy as np
 
+from .silero_vad import default_silero_vad_detector
+
 
 TARGET_LUFS = -18.0
 TRUE_PEAK_DBTP = -2.0
+REFERENCE_TARGET_LUFS = -20.0
+REFERENCE_TRUE_PEAK_DBTP = -3.0
+REFERENCE_DENOISE_SAMPLE_RATE = 48_000
 LOUDNESS_RANGE_LU = 7.0
 MAX_INTERNAL_PAUSE_SECONDS = 0.5
 INTERNAL_PAUSE_THRESHOLD_DBFS = -50.0
 INTERNAL_PAUSE_FRAME_SECONDS = 0.01
 ZERO_CROSSING_SEARCH_SECONDS = 0.005
+AUDIO_QUALITY_FRAME_SECONDS = 0.25
+AUDIO_QUALITY_MINIMUM_DBFS = -38.0
+BROADBAND_NOISE_MINIMUM_SECONDS = 1.0
+BROADBAND_NOISE_MINIMUM_ZERO_CROSSING_RATE = 0.22
+BROADBAND_NOISE_MINIMUM_CENTROID_HZ = 2200.0
+BROADBAND_NOISE_MINIMUM_FLATNESS = 0.07
+TONAL_NOISE_MINIMUM_SECONDS = 2.0
+TONAL_NOISE_MINIMUM_FREQUENCY_HZ = 500.0
+TONAL_NOISE_MAXIMUM_FREQUENCY_MAD_HZ = 60.0
+TONAL_NOISE_MAXIMUM_CENTROID_MAD_HZ = 250.0
+TONAL_NOISE_MAXIMUM_CENTROID_OFFSET_HZ = 400.0
+TONAL_NOISE_MAXIMUM_LEVEL_RANGE_DB = 12.0
+TONAL_NOISE_MAXIMUM_FLATNESS = 0.04
+LOW_FREQUENCY_COLLAPSE_MINIMUM_SECONDS = 1.0
+LOW_FREQUENCY_COLLAPSE_MAXIMUM_HZ = 120.0
+LOW_FREQUENCY_COLLAPSE_MINIMUM_POWER_FRACTION = 0.80
+LOW_FREQUENCY_COLLAPSE_MAXIMUM_DOMINANT_HZ = 100.0
+LOW_FREQUENCY_COLLAPSE_MINIMUM_DBFS = -35.0
+
+
+@dataclass(frozen=True)
+class AudioQualityIssue:
+    kind: str
+    start_seconds: float
+    end_seconds: float
 
 
 def loudness_filter() -> str:
@@ -24,6 +62,261 @@ def loudness_filter() -> str:
         f"loudnorm=I={TARGET_LUFS:g}:TP={TRUE_PEAK_DBTP:g}:"
         f"LRA={LOUDNESS_RANGE_LU:g}"
     )
+
+
+def reference_loudness_filter(
+    measurements: Mapping[str, str] | None = None,
+) -> str:
+    """Return the two-pass EBU R128 filter used for voice references."""
+
+    base = (
+        f"loudnorm=I={REFERENCE_TARGET_LUFS:g}:"
+        f"TP={REFERENCE_TRUE_PEAK_DBTP:g}:LRA={LOUDNESS_RANGE_LU:g}"
+    )
+    if measurements is None:
+        return f"aformat=channel_layouts=mono,{base}:print_format=json"
+
+    fields = {
+        "measured_I": measurements["input_i"],
+        "measured_LRA": measurements["input_lra"],
+        "measured_TP": measurements["input_tp"],
+        "measured_thresh": measurements["input_thresh"],
+        "offset": measurements["target_offset"],
+    }
+    if not all(math.isfinite(float(value)) for value in fields.values()):
+        raise RuntimeError(
+            "Reference audio is silent or too quiet for loudness normalization"
+        )
+    measured = ":".join(f"{key}={value}" for key, value in fields.items())
+    return (
+        f"aformat=channel_layouts=mono,{base}:{measured}:"
+        "linear=true:print_format=json"
+    )
+
+
+def _parse_loudness_measurements(stderr: str) -> dict[str, str]:
+    match = re.search(r'\{\s*"input_i".*?\}', stderr, flags=re.DOTALL)
+    if not match:
+        raise RuntimeError("FFmpeg did not report reference-audio loudness")
+    try:
+        measurements = json.loads(match.group(0))
+        reference_loudness_filter(measurements)
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise RuntimeError("FFmpeg reported invalid reference-audio loudness") from error
+    return measurements
+
+
+@contextmanager
+def normalized_reference_audio(
+    path: str | Path,
+    sample_rate: int,
+    *,
+    ffmpeg: str | None = None,
+) -> Iterator[Path]:
+    """Yield a normalized temporary WAV without modifying the voice sample."""
+
+    source = Path(path)
+    ffmpeg = ffmpeg or shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("FFmpeg is required to normalize reference audio")
+
+    print(f"[Reference normalization] Measuring: {source}", flush=True)
+    measurement_command = [
+        ffmpeg,
+        "-nostdin",
+        "-hide_banner",
+        "-i",
+        str(source),
+        "-af",
+        reference_loudness_filter(),
+        "-f",
+        "null",
+        "-",
+    ]
+    measured = subprocess.run(
+        measurement_command,
+        capture_output=True,
+        text=True,
+    )
+    if measured.returncode != 0:
+        detail = measured.stderr.strip() or "unknown FFmpeg error"
+        raise RuntimeError(f"FFmpeg failed to measure reference audio: {detail}")
+    measurements = _parse_loudness_measurements(measured.stderr)
+    print(
+        "[Reference normalization] "
+        f"Input: {measurements['input_i']} LUFS, "
+        f"{measurements['input_tp']} dBTP",
+        flush=True,
+    )
+
+    with tempfile.TemporaryDirectory(prefix="chatterbox-reference-") as directory:
+        normalized = Path(directory) / "normalized-reference.wav"
+        normalization_command = [
+            ffmpeg,
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "info",
+            "-y",
+            "-i",
+            str(source),
+            "-af",
+            reference_loudness_filter(measurements),
+            "-ar",
+            str(int(sample_rate)),
+            "-ac",
+            "1",
+            "-c:a",
+            "pcm_f32le",
+            str(normalized),
+        ]
+        result = subprocess.run(
+            normalization_command,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            detail = result.stderr.strip() or "unknown FFmpeg error"
+            raise RuntimeError(f"FFmpeg failed to normalize reference audio: {detail}")
+        if not normalized.is_file() or normalized.stat().st_size == 0:
+            raise RuntimeError("FFmpeg did not produce normalized reference audio")
+        output = _parse_loudness_measurements(result.stderr)
+        print(
+            "[Reference normalization] "
+            f"Output: {output.get('output_i', 'unknown')} LUFS, "
+            f"{output.get('output_tp', 'unknown')} dBTP "
+            f"({output.get('normalization_type', 'unknown')}, "
+            f"{int(sample_rate)} Hz mono; source unchanged)",
+            flush=True,
+        )
+        yield normalized
+
+
+def denoise_reference_audio(
+    path: str | Path,
+    output_path: str | Path,
+    *,
+    ffmpeg: str | None = None,
+) -> Path:
+    """Denoise a temporary 48 kHz mono copy with RNNoise."""
+
+    source = Path(path)
+    destination = Path(output_path)
+    ffmpeg = ffmpeg or shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("FFmpeg is required to prepare reference audio for denoising")
+
+    converted = destination.with_name(f".{destination.stem}-rnnoise-input.wav")
+    conversion_command = [
+        ffmpeg,
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        str(source),
+        "-ar",
+        str(REFERENCE_DENOISE_SAMPLE_RATE),
+        "-ac",
+        "1",
+        "-c:a",
+        "pcm_s16le",
+        str(converted),
+    ]
+    started = time.perf_counter()
+    print(f"[Reference denoise] Preparing RNNoise input: {source}", flush=True)
+    try:
+        converted_result = subprocess.run(
+            conversion_command,
+            capture_output=True,
+            text=True,
+        )
+        if converted_result.returncode != 0:
+            detail = converted_result.stderr.strip() or "unknown FFmpeg error"
+            raise RuntimeError(f"FFmpeg failed to prepare RNNoise input: {detail}")
+
+        from pyrnnoise import RNNoise
+
+        # pyrnnoise's file helper currently calls an obsolete audiolab Reader
+        # attribute (``rate`` rather than ``sample_rate``). Feed its supported
+        # array API directly so this path is independent of that adapter bug.
+        with wave.open(str(converted), "rb") as reader:
+            samples = np.frombuffer(
+                reader.readframes(reader.getnframes()),
+                dtype="<i2",
+            ).copy()
+        if samples.size == 0:
+            raise RuntimeError("Reference audio is empty after RNNoise conversion")
+
+        denoiser = RNNoise(REFERENCE_DENOISE_SAMPLE_RATE)
+        denoised_frames = [
+            frame
+            for _speech_probability, frame in denoiser.denoise_chunk(
+                samples[np.newaxis, :],
+                partial=True,
+            )
+        ]
+        if not denoised_frames:
+            raise RuntimeError("RNNoise did not return any denoised audio frames")
+        denoised = np.concatenate(denoised_frames, axis=1).squeeze(0)
+        denoised_pcm = np.clip(denoised, -32768, 32767).astype("<i2")
+        with wave.open(str(destination), "wb") as writer:
+            writer.setnchannels(1)
+            writer.setsampwidth(2)
+            writer.setframerate(REFERENCE_DENOISE_SAMPLE_RATE)
+            writer.writeframes(denoised_pcm.tobytes())
+        if not destination.is_file() or destination.stat().st_size == 0:
+            raise RuntimeError("RNNoise did not produce denoised reference audio")
+        print(
+            "[Reference denoise] Completed in "
+            f"{time.perf_counter() - started:.2f}s: {destination}",
+            flush=True,
+        )
+        return destination
+    finally:
+        converted.unlink(missing_ok=True)
+
+
+@contextmanager
+def prepared_reference_audio(
+    path: str | Path,
+    sample_rate: int,
+    *,
+    denoise: bool = False,
+    ffmpeg: str | None = None,
+) -> Iterator[Path]:
+    """Yield the exact denoised/normalized reference used for conditioning.
+
+    The source is never modified. If optional RNNoise processing fails, emit a
+    visible warning and safely fall back to normalizing the original reference.
+    """
+
+    source = Path(path)
+    normalization_source = source
+    with tempfile.TemporaryDirectory(prefix="chatterbox-reference-prep-") as directory:
+        if denoise:
+            denoised = Path(directory) / "denoised-reference.wav"
+            try:
+                normalization_source = denoise_reference_audio(
+                    source,
+                    denoised,
+                    ffmpeg=ffmpeg,
+                )
+            except Exception as error:
+                print(
+                    "[Reference denoise] WARNING: RNNoise failed; using the "
+                    f"original reference instead: {error}",
+                    flush=True,
+                )
+                normalization_source = source
+
+        with normalized_reference_audio(
+            normalization_source,
+            sample_rate,
+            ffmpeg=ffmpeg,
+        ) as normalized:
+            yield normalized
 
 
 def normalize_speech_wav(
@@ -72,6 +365,218 @@ def normalize_speech_wav(
     finally:
         temporary.unlink(missing_ok=True)
     return source
+
+
+def _quality_ranges(mask: np.ndarray, minimum_frames: int) -> list[tuple[int, int]]:
+    ranges: list[tuple[int, int]] = []
+    start: int | None = None
+    for index, flagged in enumerate(mask):
+        if flagged and start is None:
+            start = index
+        elif not flagged and start is not None:
+            if index - start >= minimum_frames:
+                ranges.append((start, index))
+            start = None
+    if start is not None and len(mask) - start >= minimum_frames:
+        ranges.append((start, len(mask)))
+    return ranges
+
+
+def _expand_quality_ranges(
+    ranges: list[tuple[int, int]],
+    support: np.ndarray,
+) -> list[tuple[int, int]]:
+    """Expand high-confidence detections across their adjacent artifact frames."""
+
+    expanded: list[tuple[int, int]] = []
+    for start, end in ranges:
+        while start > 0 and support[start - 1]:
+            start -= 1
+        while end < len(support) and support[end]:
+            end += 1
+        if expanded and start <= expanded[-1][1]:
+            expanded[-1] = (expanded[-1][0], max(expanded[-1][1], end))
+        else:
+            expanded.append((start, end))
+    return expanded
+
+
+def find_generated_audio_issues(
+    samples,
+    sample_rate: int,
+    *,
+    include_vad: bool = False,
+) -> list[AudioQualityIssue]:
+    """Find known Chatterbox synthesis-collapse patterns anywhere.
+
+    Chatterbox can emit invalid speech-token runs in the middle of otherwise
+    valid speech and then recover. Analyze every complete 250 ms frame so those
+    failures are not hidden merely because the final seconds sound normal.
+    """
+
+    rate = int(sample_rate)
+    if rate <= 0:
+        return []
+    frame_size = max(1, round(rate * AUDIO_QUALITY_FRAME_SECONDS))
+    flattened = np.asarray(samples, dtype=np.float32).reshape(-1)
+    frame_count = flattened.size // frame_size
+    if frame_count < 1:
+        return []
+
+    frames = flattened[:frame_count * frame_size].reshape(frame_count, frame_size)
+    frames = frames - np.mean(frames, axis=1, keepdims=True)
+    rms = np.sqrt(np.mean(frames * frames, axis=1) + 1e-12)
+    rms_dbfs = 20.0 * np.log10(rms + 1e-12)
+    zero_crossings = np.mean(
+        np.signbit(frames[:, :-1]) != np.signbit(frames[:, 1:]), axis=1
+    )
+
+    window = np.hanning(frame_size).astype(np.float32)
+    power = np.abs(np.fft.rfft(frames * window, axis=1)) ** 2
+    power[:, 0] = 0
+    frequencies = np.fft.rfftfreq(frame_size, 1.0 / rate)
+    totals = np.sum(power, axis=1) + 1e-30
+    dominant = frequencies[np.argmax(power, axis=1)]
+    centroids = np.sum(power * frequencies, axis=1) / totals
+    flatness = np.exp(np.mean(np.log(power + 1e-30), axis=1)) / (
+        np.mean(power, axis=1) + 1e-30
+    )
+
+    issues: list[AudioQualityIssue] = []
+
+    low_frequency_power = np.sum(
+        power[:, frequencies <= LOW_FREQUENCY_COLLAPSE_MAXIMUM_HZ],
+        axis=1,
+    ) / totals
+    low_frequency_core = (
+        (rms_dbfs >= LOW_FREQUENCY_COLLAPSE_MINIMUM_DBFS)
+        & (
+            low_frequency_power
+            >= LOW_FREQUENCY_COLLAPSE_MINIMUM_POWER_FRACTION
+        )
+    )
+    low_frequency_support = (
+        (rms_dbfs >= LOW_FREQUENCY_COLLAPSE_MINIMUM_DBFS)
+        & (dominant <= LOW_FREQUENCY_COLLAPSE_MAXIMUM_DOMINANT_HZ)
+    )
+    low_frequency_frames = max(
+        1,
+        round(
+            LOW_FREQUENCY_COLLAPSE_MINIMUM_SECONDS
+            / AUDIO_QUALITY_FRAME_SECONDS
+        ),
+    )
+    low_frequency_ranges = _quality_ranges(
+        low_frequency_core,
+        low_frequency_frames,
+    )
+    for start, end in _expand_quality_ranges(
+        low_frequency_ranges,
+        low_frequency_support,
+    ):
+        issues.append(
+            AudioQualityIssue(
+                "low-frequency synthesis collapse",
+                start * AUDIO_QUALITY_FRAME_SECONDS,
+                end * AUDIO_QUALITY_FRAME_SECONDS,
+            )
+        )
+
+    broadband = (
+        (rms_dbfs >= AUDIO_QUALITY_MINIMUM_DBFS)
+        & (zero_crossings >= BROADBAND_NOISE_MINIMUM_ZERO_CROSSING_RATE)
+        & (centroids >= BROADBAND_NOISE_MINIMUM_CENTROID_HZ)
+        & (flatness >= BROADBAND_NOISE_MINIMUM_FLATNESS)
+    )
+    broadband_frames = max(
+        1, round(BROADBAND_NOISE_MINIMUM_SECONDS / AUDIO_QUALITY_FRAME_SECONDS)
+    )
+    for start, end in _quality_ranges(broadband, broadband_frames):
+        issues.append(
+            AudioQualityIssue(
+                "broadband digital noise",
+                start * AUDIO_QUALITY_FRAME_SECONDS,
+                end * AUDIO_QUALITY_FRAME_SECONDS,
+            )
+        )
+
+    tonal_frames = max(
+        1, round(TONAL_NOISE_MINIMUM_SECONDS / AUDIO_QUALITY_FRAME_SECONDS)
+    )
+    tonal = np.zeros(frame_count, dtype=bool)
+    for start in range(0, frame_count - tonal_frames + 1):
+        end = start + tonal_frames
+        levels = rms_dbfs[start:end]
+        tones = dominant[start:end]
+        centers = centroids[start:end]
+        texture = flatness[start:end]
+        tone_median = float(np.median(tones))
+        center_median = float(np.median(centers))
+        if (
+            float(np.min(levels)) >= AUDIO_QUALITY_MINIMUM_DBFS
+            and float(np.max(levels) - np.min(levels))
+            <= TONAL_NOISE_MAXIMUM_LEVEL_RANGE_DB
+            and tone_median >= TONAL_NOISE_MINIMUM_FREQUENCY_HZ
+            and float(np.median(np.abs(tones - tone_median)))
+            <= TONAL_NOISE_MAXIMUM_FREQUENCY_MAD_HZ
+            and float(np.median(np.abs(centers - center_median)))
+            <= TONAL_NOISE_MAXIMUM_CENTROID_MAD_HZ
+            and float(np.median(np.abs(centers - tones)))
+            <= TONAL_NOISE_MAXIMUM_CENTROID_OFFSET_HZ
+            and float(np.median(texture)) <= TONAL_NOISE_MAXIMUM_FLATNESS
+        ):
+            tonal[start:end] |= (
+                (levels >= AUDIO_QUALITY_MINIMUM_DBFS)
+                & (
+                    np.abs(tones - tone_median)
+                    <= 2 * TONAL_NOISE_MAXIMUM_FREQUENCY_MAD_HZ
+                )
+                & (
+                    np.abs(centers - center_median)
+                    <= 2 * TONAL_NOISE_MAXIMUM_CENTROID_MAD_HZ
+                )
+                & (texture <= TONAL_NOISE_MAXIMUM_FLATNESS)
+            )
+    for start, end in _quality_ranges(tonal, tonal_frames):
+        issues.append(
+            AudioQualityIssue(
+                "sustained synthetic tone",
+                start * AUDIO_QUALITY_FRAME_SECONDS,
+                end * AUDIO_QUALITY_FRAME_SECONDS,
+            )
+        )
+
+    if include_vad:
+        for no_speech in default_silero_vad_detector.find_loud_no_speech_ranges(
+            flattened,
+            rate,
+        ):
+            issues.append(
+                AudioQualityIssue(
+                    "audible non-speech synthesis blob",
+                    no_speech.start_seconds,
+                    no_speech.end_seconds,
+                )
+            )
+
+    return sorted(issues, key=lambda issue: (issue.start_seconds, issue.end_seconds))
+
+
+def format_audio_quality_issues(issues: list[AudioQualityIssue]) -> str:
+    return "; ".join(
+        f"{issue.kind} at {issue.start_seconds:.2f}-{issue.end_seconds:.2f}s"
+        for issue in issues
+    )
+
+
+def wav_generated_audio_issues(
+    path: str | Path,
+    sample_rate: int,
+) -> list[AudioQualityIssue]:
+    """Scan a normalized mono PCM16 chunk for generated-audio corruption."""
+
+    samples = _read_pcm16_mono(Path(path), sample_rate).astype(np.float32) / 32768.0
+    return find_generated_audio_issues(samples, sample_rate, include_vad=True)
 
 
 def _read_pcm16_mono(path: Path, expected_sample_rate: int) -> np.ndarray:

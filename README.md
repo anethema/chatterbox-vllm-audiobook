@@ -1,6 +1,6 @@
 # Chatterbox vLLM Audiobook
 
-Turn DRM-free EPUB books into chaptered M4B audiobooks with Chatterbox TTS and vLLM. This fork adds a Gradio web interface, sentence-aware EPUB processing, batched GPU generation, resumable projects, loudness normalization, and parallel FFmpeg assembly to [randombk/chatterbox-vllm](https://github.com/randombk/chatterbox-vllm).
+Turn DRM-free EPUB books into chaptered M4B audiobooks with Chatterbox TTS and vLLM. This fork adds a Gradio web interface, sentence-aware EPUB processing, batched GPU generation, resumable projects, optional reference denoising, generated-audio quality recovery, loudness normalization, and parallel FFmpeg assembly to [randombk/chatterbox-vllm](https://github.com/randombk/chatterbox-vllm).
 
 The web interface currently targets English narration and defaults to the pinned **Chatterbox Multilingual V3 model in English mode**. The original English and Multilingual V2 checkpoints remain selectable through environment variables for compatibility with older projects.
 
@@ -13,6 +13,12 @@ The web interface currently targets English narration and defaults to the pinned
 - Sentence-aware text chunking and batched vLLM speech generation
 - Multilingual V3 in English mode as the default model
 - A text-sample tab for testing a reference voice before starting a book
+- Optional RNNoise reference denoising before two-pass loudness normalization
+- Exact processed-reference playback in the Gradio player
+- Conservative inference-only cleanup of troublesome EPUB punctuation, citations, and dotted initials
+- Full-waveform corruption scans using deterministic signal checks and CPU-based Silero VAD
+- Fresh-seed retry and bounded recursive text splitting when generated audio fails a quality scan
+- Colored per-batch and final quality summaries in the terminal
 - Progress reporting with generated chunks, realtime speed, and ETA
 - Background WAV saving and normalization while GPU generation continues
 - EBU R128 speech normalization to -18 LUFS for previews and audiobook chunks
@@ -32,7 +38,7 @@ The web interface currently targets English narration and defaults to the pinned
 - At least 20 GB of free disk space for the environment, CUDA libraries, model cache, and outputs
 - Enough system RAM and swap for long books
 
-The default batch size of 16 was tested on an RTX 4090 with 24 GB of VRAM. Smaller GPUs may need a lower batch size. The installer pins Python 3.12, PyTorch 2.7.1, and vLLM 0.10.0 through the committed lockfile.
+The default batch size of 64 was tested on an RTX 4090 with 24 GB of VRAM. Smaller GPUs may need a lower batch size. The installer pins Python 3.12, PyTorch 2.7.1, vLLM 0.10.0, Silero VAD, and the compatible RNNoise audio stack through the committed lockfile.
 
 The project does not require a separately installed CUDA Toolkit. PyTorch's Linux package supplies its CUDA runtime dependencies. The NVIDIA driver remains a system prerequisite and is not installed by this repository.
 
@@ -76,11 +82,12 @@ The installer:
 3. Installs [uv](https://docs.astral.sh/uv/) with Astral's official installer when needed.
 4. Creates <code>.venv</code> with Python 3.12.
 5. Installs the exact dependencies in <code>uv.lock</code>.
-6. Verifies CUDA through PyTorch and prints the PyTorch, CUDA runtime, vLLM, GPU, FFmpeg, and FFprobe versions.
+6. Runs a real RNNoise-then-normalization smoke test on the bundled reference clip.
+7. Verifies CUDA through PyTorch and prints the PyTorch, CUDA runtime, vLLM, Silero VAD, RNNoise stack, GPU, FFmpeg, and FFprobe versions.
 
 It does not install or modify the NVIDIA driver.
 
-### Manual installation
+### Manual installation with uv
 
 ~~~bash
 sudo apt update
@@ -94,10 +101,30 @@ cd chatterbox-vllm-audiobook
 uv sync --locked --python 3.12
 ~~~
 
+### Manual installation with pip
+
+For users who already have Python 3.12 and prefer a conventional virtual environment, <code>requirements.txt</code> is generated from <code>uv.lock</code> and pins the same runtime dependency versions:
+
+~~~bash
+sudo apt update
+sudo apt install -y git curl ffmpeg
+
+git clone https://github.com/anethema/chatterbox-vllm-audiobook.git
+cd chatterbox-vllm-audiobook
+
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python -m pip install --no-deps -e .
+~~~
+
+The final editable install adds this project without asking pip to resolve the dependency graph a second time. Do not install the package first without <code>--no-deps</code>, because that would ignore the exact transitive versions exported from the lockfile. The pip path still requires Linux or WSL2, a working NVIDIA driver, FFmpeg, and FFprobe.
+
 Verify the environment:
 
 ~~~bash
-.venv/bin/python -c 'import torch, vllm; print(torch.__version__, torch.version.cuda, vllm.__version__); print(torch.cuda.get_device_name(0)); assert torch.cuda.is_available()'
+.venv/bin/python -c 'from importlib.metadata import version; import torch, vllm; print(torch.__version__, torch.version.cuda, vllm.__version__); print(version("silero-vad"), version("pyrnnoise"), version("audiolab"), version("av")); print(torch.cuda.get_device_name(0)); assert torch.cuda.is_available()'
 ffmpeg -version
 ffprobe -version
 ~~~
@@ -135,7 +162,7 @@ Gradio prints a temporary <code>gradio.live</code> URL. There is no authenticati
 ## Creating an audiobook
 
 1. Open the **EPUB Audiobook** tab.
-2. Upload or record a clean reference voice sample.
+2. Upload or record a clean reference voice sample. Optionally enable **Denoise reference before normalization (RNNoise)** before or after loading it.
 3. Upload a DRM-free EPUB and review the detected chapter and chunk counts.
 4. Adjust generation settings if needed.
 5. Click **Generate EPUB Audiobook**.
@@ -153,8 +180,9 @@ Current UI defaults:
 | Min-P | 0.05 |
 | Top-P | 1.0 |
 | Repetition penalty | 1.2 |
-| Maximum chunk length | 280 characters |
-| vLLM batch size | 16 |
+| Reference denoising | Off |
+| Maximum chunk length | 200 characters |
+| vLLM batch size | 64 |
 | Loudness target | -18 LUFS |
 | V3 maximum internal pause | 500 ms |
 
@@ -162,6 +190,13 @@ Larger batches can improve GPU throughput but increase peak resource use. Diffus
 
 Opening another browser tab does not load another model copy; every tab uses the same server process and model. Do not start overlapping text and EPUB jobs, because separate Gradio events can contend for the same GPU, CPU, and RAM and may make a long conversion appear stalled.
 
+Uploaded voice references are processed from a temporary copy; the original upload is never changed. With reference denoising disabled, the app applies two-pass normalization to -20 LUFS with a -3 dBTP ceiling. With it enabled, RNNoise first suppresses steady background noise and the denoised result is then normalized. The checkbox can be changed before or after loading a sample, and the Gradio player immediately updates to the same processing used by both the Text Sample and EPUB paths. The choice is saved with new audiobook projects and restored on resume. If RNNoise unexpectedly fails, the terminal prints a visible warning and generation safely falls back to the normalized original.
+
+Reference denoising is intentionally optional. It can help a quiet recording whose normalization would otherwise magnify hiss or hum, but an already clean sample may sound more natural with it disabled. Listen to the processed reference in the player before starting a long book.
+
+Immediately before inference, the app conservatively removes unsupported quotation marks and decorative symbols, strips attached numeric citations, and spaces uppercase dotted initials such as <code>J.R.R.</code>. Ordinary punctuation, decimal numbers, abbreviations such as <code>p.m.</code>, and multilingual letters are retained. This cleanup affects only the text sent to the model; original EPUB text remains in project metadata.
+
+Every generated waveform is scanned before it is accepted. The scanner combines deterministic spectral checks with CPU-based Silero VAD to find audible non-speech blobs that may evade a simple tone detector. A failed chunk is regenerated once with a fresh random seed, then split into progressively smaller text if necessary. A repeatedly failing single sentence is retained with a red warning so an unattended project continues instead of stopping indefinitely. The terminal prints one green or red result for each batch and a colored detected/fixed/retained summary when the project finishes.
 ## Output files
 
 Each conversion creates a timestamped folder beneath <code>audiobook_outputs/</code>:
@@ -193,7 +228,7 @@ To resume:
 4. Select the project; its saved EPUB and reference audio load automatically.
 5. Click **Resume Selected Project**.
 
-Resume validates the saved EPUB's chunk plan and scans the actual WAV files rather than trusting the displayed percentage. It restarts at a safe batch boundary if the final batch was interrupted. When every WAV is already valid, resume skips speech generation and goes directly to M4B assembly.
+Resume validates the saved EPUB's chunk plan and deeply scans the actual WAV files rather than trusting the displayed percentage. It restarts at a safe batch boundary if the final batch was interrupted. When every WAV is already valid, resume skips speech generation and goes directly to M4B assembly.
 
 Projects created before saved inputs were implemented may request the original EPUB and reference audio once. A project with unfinished speech must use its recorded model version so one audiobook cannot silently mix voices from different models.
 
@@ -240,6 +275,12 @@ git pull --ff-only origin master
 
 Rerunning the installer is safe and synchronizes <code>.venv</code> to the updated lockfile. Model files already present in the Hugging Face cache are reused.
 
+The committed <code>requirements.txt</code> is a generated pip compatibility file. When dependencies change, regenerate it from the validated lockfile instead of editing it manually:
+
+~~~bash
+uv export --locked --no-dev --no-emit-project --no-hashes --format requirements.txt --output-file requirements.txt
+~~~
+
 Development changes are prepared on feature branches and merged into <code>master</code> after testing.
 
 ## Tests
@@ -250,7 +291,13 @@ Run the unit suite without loading the model:
 .venv/bin/python -m unittest discover -v tests
 ~~~
 
-The first real generation is the practical CUDA/model-load check. Start with a short text sample before converting a long book.
+Run the opt-in GPU smoke test to exercise model loading, RNNoise conditioning, EPUB generation, quality scanning, stop/resume, M4B assembly, and final verification. It creates and removes its own small test projects:
+
+~~~bash
+.venv/bin/python tests/epub_gpu_smoke.py
+~~~
+
+For ordinary use, start with a short text sample before converting a long book.
 
 ## Troubleshooting
 
@@ -285,6 +332,10 @@ ffprobe -version
 
 The intermediate WAVs remain available when final encoding or verification fails, allowing assembly-only resume after the problem is corrected.
 
+### Reference denoising reports a warning
+
+Rerun <code>./install_linux.sh</code>. The installer verifies the exact compatible versions of pyrnnoise, audiolab, and PyAV and runs a real denoise/normalization smoke test. If a failure still occurs, generation falls back to the normalized original reference and prints the reason in the terminal.
+
 ### Lower-memory GPU or system
 
 Try a smaller vLLM batch size and ensure Linux has adequate RAM and swap. Only run one app process; separate processes each load their own model and compete for VRAM.
@@ -297,6 +348,8 @@ This remains a personal project built on:
 - [randombk/chatterbox-vllm](https://github.com/randombk/chatterbox-vllm)
 - [vLLM](https://github.com/vllm-project/vllm)
 - [Gradio](https://www.gradio.app/)
+- [Silero VAD](https://github.com/snakers4/silero-vad)
+- [pyrnnoise](https://github.com/pengzhendong/pyrnnoise)
 
 The vLLM integration uses internal APIs and is intentionally pinned to vLLM 0.10.0. APIs and model behavior may change on future upgrades.
 

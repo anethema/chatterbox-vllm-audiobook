@@ -274,7 +274,9 @@ _ABBREVIATIONS = {
     "capt", "col", "dr", "e.g", "etc", "fig", "gen", "i.e", "jr", "lt",
     "mr", "mrs", "ms", "no", "prof", "rev", "sen", "sgt", "sr", "st", "vs",
 }
-_CLOSING_PUNCTUATION = '"\'”’)]}'
+_CLOSING_PUNCTUATION = '"\'”’»)]}'
+_DIALOGUE_DOUBLE_QUOTES = frozenset('"“”„‟«»')
+_MIN_STANDALONE_DIALOGUE_CHARS = 80
 
 
 def _is_nonterminal_period(text: str, period_index: int) -> bool:
@@ -381,7 +383,17 @@ def chunk_text(text: str, max_chars: int = 280) -> list[str]:
     current = ""
     for sentence in split_sentences(text):
         sentence_parts = [sentence] if len(sentence) <= max_chars else _split_oversized(sentence, max_chars)
+        is_dialogue_turn = (
+            len(sentence) >= _MIN_STANDALONE_DIALOGUE_CHARS
+            and any(mark in sentence for mark in _DIALOGUE_DOUBLE_QUOTES)
+        )
+        if is_dialogue_turn and current:
+            chunks.append(current)
+            current = ""
         for part in sentence_parts:
+            if is_dialogue_turn:
+                chunks.append(part)
+                continue
             candidate = f"{current} {part}".strip()
             if current and len(candidate) > max_chars:
                 chunks.append(current)
@@ -391,6 +403,38 @@ def chunk_text(text: str, max_chars: int = 280) -> list[str]:
     if current:
         chunks.append(current)
     return chunks
+
+
+def split_text_for_recovery(text: str) -> list[str]:
+    """Split one failed speech chunk into two natural, balanced pieces."""
+
+    normalized = " ".join(text.split())
+    sentences = split_sentences(normalized)
+    if len(sentences) >= 2:
+        candidates = []
+        for index in range(1, len(sentences)):
+            left = " ".join(sentences[:index])
+            right = " ".join(sentences[index:])
+            candidates.append((abs(len(left) - len(right)), left, right))
+        _, left, right = min(candidates, key=lambda candidate: candidate[0])
+        return [left, right]
+
+    midpoint = len(normalized) / 2
+    boundaries = [
+        match.end()
+        for match in re.finditer(r"[,;:—–]\s+", normalized)
+    ]
+    if not boundaries:
+        boundaries = [
+            match.start()
+            for match in re.finditer(r"\s+", normalized)
+        ]
+    if not boundaries:
+        return [normalized]
+    boundary = min(boundaries, key=lambda index: abs(index - midpoint))
+    left = normalized[:boundary].strip()
+    right = normalized[boundary:].strip()
+    return [part for part in (left, right) if part]
 
 
 def chunk_book(book: EpubBook, max_chars: int = 280) -> list[TextChunk]:

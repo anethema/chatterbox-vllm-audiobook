@@ -4,7 +4,16 @@ import unittest
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile
 
-from chatterbox_vllm.epub import EpubError, chunk_book, chunk_text, load_epub, split_sentences
+from chatterbox_vllm.epub import (
+    EpubBook,
+    EpubChapter,
+    EpubError,
+    chunk_book,
+    chunk_text,
+    load_epub,
+    split_sentences,
+    split_text_for_recovery,
+)
 
 
 CONTAINER = """<?xml version="1.0"?>
@@ -89,9 +98,72 @@ class EpubTests(unittest.TestCase):
         self.assertTrue(all(len(chunk) <= 100 for chunk in chunks))
         self.assertTrue(chunks[0].startswith("One short sentence. Two short sentences."))
 
+    def test_substantial_dialogue_turns_are_not_merged_with_narration(self):
+        dialogue = (
+            '"This quoted dialogue is deliberately long enough to deserve its '
+            'own natural speech chunk and boundary."'
+        )
+        text = f"Narration before. {dialogue} Narration after."
+
+        chunks = chunk_text(text, max_chars=120)
+
+        self.assertEqual(
+            chunks,
+            ["Narration before.", dialogue, "Narration after."],
+        )
+        self.assertTrue(all(len(chunk) <= 120 for chunk in chunks))
+
+    def test_short_dialogue_is_not_emitted_as_an_undersized_chunk(self):
+        text = (
+            'Narration before. It is the Academy that is failing them.” '
+            '“That is a bit harsh, is it not? Narration after.'
+        )
+
+        chunks = chunk_text(text, max_chars=200)
+
+        self.assertEqual(chunks, [text])
+        self.assertTrue(all(len(chunk) <= 200 for chunk in chunks))
+
+    def test_chunk_metadata_retains_original_dialogue_text(self):
+        dialogue = (
+            '"Keep these quotation marks in project metadata even though the '
+            'inference cleanup removes them before sending text into TTS."'
+        )
+        text = f"Narration before. {dialogue} Narration after."
+        book = EpubBook("Book", (EpubChapter("Chapter", text, "chapter.xhtml"),))
+
+        chunks = chunk_book(book, max_chars=140)
+
+        self.assertEqual(chunks[1].text, dialogue)
+        self.assertIn('"', chunks[1].text)
+
     def test_chunks_pathologically_long_word_without_exceeding_limit(self):
         chunks = chunk_text("A prefix " + ("x" * 205) + ".", max_chars=100)
         self.assertTrue(all(len(chunk) <= 100 for chunk in chunks))
+
+    def test_recovery_split_prefers_a_balanced_sentence_boundary(self):
+        text = (
+            "If the most talented among us are preoccupied with maintaining the "
+            "barrier and making life inside more pleasant, then what about the "
+            "threats outside? They will only grow worse with time.” Brynn took "
+            "Samuel’s hand."
+        )
+
+        self.assertEqual(
+            split_text_for_recovery(text),
+            [
+                "If the most talented among us are preoccupied with maintaining "
+                "the barrier and making life inside more pleasant, then what "
+                "about the threats outside?",
+                "They will only grow worse with time.” Brynn took Samuel’s hand.",
+            ],
+        )
+
+    def test_recovery_split_uses_a_clause_or_word_boundary_for_one_sentence(self):
+        self.assertEqual(
+            split_text_for_recovery("Alpha beta gamma, delta epsilon zeta."),
+            ["Alpha beta gamma,", "delta epsilon zeta."],
+        )
 
     def test_chunks_do_not_cross_chapter_boundaries(self):
         with tempfile.TemporaryDirectory() as directory:
