@@ -19,7 +19,7 @@ The web interface currently targets English narration and defaults to the pinned
 - Full-waveform corruption scans using deterministic signal checks and CPU-based Silero VAD
 - Fresh-seed retry and bounded recursive text splitting when generated audio fails a quality scan
 - Colored per-batch and final quality summaries in the terminal
-- Progress reporting with generated chunks, realtime speed, and ETA
+- Reconnectable server-side progress with generated chunks, realtime speed, and ETA
 - Background WAV saving and normalization while GPU generation continues
 - EBU R128 speech normalization to -18 LUFS for previews and audiobook chunks
 - V3 internal pauses capped at 500 ms without changing edge silence
@@ -141,7 +141,9 @@ Open <http://127.0.0.1:7860>. The server listens on <code>0.0.0.0:7860</code>, s
 http://LINUX_MACHINE_IP:7860
 ~~~
 
-On WSL2, Windows can normally open the localhost URL directly. Files in the repository are also available from Windows Explorer at a path similar to:
+The LAN interface has no authentication. Use it only on a trusted network, and do not expose port 7860 directly to the internet. On ordinary Linux, allow the port through the host firewall only when LAN access is wanted. WSL2 networking varies by Windows and WSL configuration: Windows can normally open the localhost URL directly, but other LAN devices may require WSL mirrored networking or an explicit Windows port-forwarding and firewall rule. Listening on <code>0.0.0.0</code> does not by itself guarantee that a default NAT-based WSL2 instance is reachable from the rest of the LAN.
+
+Files in a WSL2 repository are available from Windows Explorer at a path similar to:
 
 ~~~text
 \\wsl.localhost\Ubuntu\home\YOUR_UBUNTU_USER\chatterbox-vllm-audiobook
@@ -149,7 +151,9 @@ On WSL2, Windows can normally open the localhost URL directly. Files in the repo
 
 The first launch downloads the pinned model files from [ResembleAI/chatterbox](https://huggingface.co/ResembleAI/chatterbox). Multilingual V3 uses the pinned <code>t3_mtl23ls_v3.safetensors</code> checkpoint plus the shared voice encoder, S3Gen, tokenizer, and conditioning files. Hugging Face normally caches them under <code>~/.cache/huggingface/hub</code>, so later launches reuse the download.
 
-Keep the terminal process running while generating. Closing a browser tab does not unload the model or necessarily cancel a queued server job, but reopening the page does not reconnect to the old progress display. If the process itself stops, resume the saved project after restarting it.
+Keep the terminal process running while generating. Closing a browser tab does not unload the model or cancel the server job. The browser that starts or resumes a job receives Gradio's native queued-event progress display. If that page reloads, disconnects, or is replaced by a browser on another device, Gradio cannot reattach its original progress display to the new page. The bottom **Job monitor** instead polls durable server-side state and restores the current phase, progress, chunk count, speed, ETA, and **Stop Generation** control from any connected browser. It observes the same running job; it does not start another model or conversion.
+
+If the server process itself stops, generation stops with it. After the app restarts, the monitor marks the prior job as interrupted and the saved project can be resumed.
 
 ### Temporary public link
 
@@ -197,6 +201,7 @@ Reference denoising is intentionally optional. It can help a quiet recording who
 Immediately before inference, the app conservatively removes unsupported quotation marks and decorative symbols, strips attached numeric citations, and spaces uppercase dotted initials such as <code>J.R.R.</code>. Ordinary punctuation, decimal numbers, abbreviations such as <code>p.m.</code>, and multilingual letters are retained. This cleanup affects only the text sent to the model; original EPUB text remains in project metadata.
 
 Every generated waveform is scanned before it is accepted. The scanner combines deterministic spectral checks with CPU-based Silero VAD to find audible non-speech blobs that may evade a simple tone detector. A failed chunk is regenerated once with a fresh random seed, then split into progressively smaller text if necessary. A repeatedly failing single sentence is retained with a red warning so an unattended project continues instead of stopping indefinitely. The terminal prints one green or red result for each batch and a colored detected/fixed/retained summary when the project finishes.
+
 ## Output files
 
 Each conversion creates a timestamped folder beneath <code>audiobook_outputs/</code>:
@@ -208,9 +213,12 @@ audiobook_outputs/Book-YYYYMMDD-HHMMSS-ID/
 │   └── reference-audio.ext
 ├── metadata.json
 ├── progress.json          # incomplete projects only
+├── quality-scan.json      # verified resume-scan cache for incomplete projects
 ├── chunks/                # incomplete projects only
 └── audiobook.m4b          # completed projects
 ~~~
+
+The output root also contains a small <code>active-job.json</code> status file. It lets newly opened browser sessions display and control the server's current job; it contains no audio and is replaced atomically as progress changes.
 
 The finished M4B contains AAC audio, chapter markers, and available EPUB title, author, cover, language, publisher, description, date, and identifier metadata.
 
@@ -218,7 +226,7 @@ After assembly, the app uses FFprobe to verify that the M4B contains readable AA
 
 ## Stopping and resuming
 
-The **Stop Generation** button requests an orderly stop. Valid normalized WAVs, project metadata, the source EPUB, and the reference voice are preserved.
+The **Stop Generation** button requests an orderly stop. It works from any browser connected to the same running app, including a browser that did not start the job. The current GPU batch or encoding operation may need to finish before the stopped state appears. Valid normalized WAVs, project metadata, the source EPUB, and the reference voice are preserved.
 
 To resume:
 
@@ -226,9 +234,9 @@ To resume:
 2. Expand **Resume an incomplete project**.
 3. Click **Refresh Incomplete Projects** if necessary.
 4. Select the project; its saved EPUB and reference audio load automatically.
-5. Click **Resume Selected Project**.
+5. Click **Resume Selected / Monitored Project**. On a newly connected browser, the monitored stopped or interrupted project is used automatically when no dropdown choice is selected.
 
-Resume validates the saved EPUB's chunk plan and deeply scans the actual WAV files rather than trusting the displayed percentage. It restarts at a safe batch boundary if the final batch was interrupted. When every WAV is already valid, resume skips speech generation and goes directly to M4B assembly.
+Resume validates the saved EPUB's chunk plan and deeply scans WAV files that have not already passed the current detector. Verified files are cached by size and modification time; changed, missing, stale, or malformed cache entries are scanned again. Resume restarts at a safe batch boundary if the final batch was interrupted. When every WAV is already valid, it skips speech generation and goes directly to M4B assembly.
 
 Projects created before saved inputs were implemented may request the original EPUB and reference audio once. A project with unfinished speech must use its recorded model version so one audiobook cannot silently mix voices from different models.
 
@@ -316,6 +324,12 @@ Another copy of the app is probably running. Stop the older process before launc
 ~~~bash
 ss -ltnp | grep ':7860'
 ~~~
+
+### The browser disconnects or shows an error during generation
+
+Check the app terminal first. If generation is still printing progress, leave that process running and reopen the same local, LAN, or active Gradio share URL. The bottom **Job monitor** reconnects to the server-side job and can request a stop, although Gradio's original queued-event progress display cannot be transferred to the new browser session.
+
+A temporary Gradio share tunnel can fail while the local app continues running. When possible, reconnect through <http://127.0.0.1:7860> on the host or the trusted-LAN address instead. Do not launch a second app process to regain browser access, because it would load another model and compete for GPU memory.
 
 ### A long conversion stops or reports an error
 
