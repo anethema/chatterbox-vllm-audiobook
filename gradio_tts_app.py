@@ -72,6 +72,7 @@ from chatterbox_vllm.projects import (
     write_quality_scan_checkpoint,
     write_project_progress,
 )
+from chatterbox_vllm.job_status import JobStatusStore, render_job_status
 from chatterbox_vllm.progress import GenerationControl, estimate_progress, format_duration
 from chatterbox_vllm.tts import ChatterboxTTS
 
@@ -97,9 +98,47 @@ RESUME_SCAN_PROGRESS_UPDATE_CHUNKS = 100
 QUALITY_SCAN_CHECKPOINT_UPDATE_SECONDS = 30.0
 QUALITY_SCAN_CHECKPOINT_UPDATE_CHUNKS = 1000
 
+JOB_MONITOR_CSS = """
+#active-job-monitor { margin-top: 0.6rem; margin-bottom: 0.6rem; }
+#active-job-monitor .active-job-monitor {
+    border: 1px solid var(--border-color-primary, #9ca3af);
+    border-radius: 8px;
+    background: var(--block-background-fill, #ffffff);
+    padding: 0.65rem 0.8rem;
+}
+#active-job-monitor .active-job-monitor__heading {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 0.75rem;
+    margin-bottom: 0.45rem;
+}
+#active-job-monitor .active-job-monitor__heading span,
+#active-job-monitor .active-job-monitor__metrics {
+    color: var(--body-text-color-subdued, #6b7280);
+    font-size: 0.9em;
+}
+#active-job-monitor .active-job-monitor__track {
+    height: 0.55rem;
+    overflow: hidden;
+    border-radius: 999px;
+    background: var(--neutral-300, #d1d5db);
+}
+#active-job-monitor .active-job-monitor__fill {
+    height: 100%;
+    min-width: 0;
+    border-radius: inherit;
+    background: var(--primary-500, #2563eb);
+    transition: width 0.25s ease-out;
+}
+#active-job-monitor .active-job-monitor__metrics { margin-top: 0.4rem; }
+#active-job-monitor .active-job-monitor__message { margin-top: 0.2rem; }
+"""
+
 config_seed = None
 global_model = None
 generation_control = GenerationControl()
+job_status = JobStatusStore(OUTPUT_ROOT)
 reference_preview_directory: tempfile.TemporaryDirectory | None = None
 
 
@@ -404,9 +443,22 @@ def inspect_epub_file(epub_path, max_chars):
         return f"❌ {error}"
 
 
+def _job_monitor_render():
+    """Return durable job state for any browser session polling the app."""
+
+    snapshot = job_status.snapshot()
+    return (
+        render_job_status(snapshot, format_duration=format_duration),
+        gr.Button(interactive=snapshot.state == "running"),
+        gr.Button(interactive=not snapshot.active),
+        gr.Button(interactive=not snapshot.active),
+    )
+
+
 def request_generation_stop():
     if not generation_control.request_stop():
         return "No EPUB generation is currently running."
+    job_status.request_stop()
     return (
         "⏹️ Stop requested. The current vLLM batch will finish, or active M4B "
         "encoding processes will be stopped."
@@ -1008,12 +1060,44 @@ def _protect_system_memory(batch_number: int) -> None:
         )
 
 
+def _monitored_resume_project_name(selected_project_name: str | None) -> str | None:
+    """Prefer an explicit choice; otherwise expose only a safely resumable job."""
+
+    if selected_project_name:
+        return selected_project_name
+    snapshot = job_status.snapshot()
+    if snapshot.state in {"stopped", "interrupted", "failed"}:
+        return snapshot.project_id
+    return None
+
+
+def resume_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weight,
+                           temperature, seed_num, diffusion_steps, min_p,
+                           top_p, repetition_penalty, max_chars, batch_size,
+                           denoise_reference, resume_project_name,
+                           progress=gr.Progress()):
+    """Resume an explicit project or the latest safely resumable monitored job."""
+
+    project_name = _monitored_resume_project_name(resume_project_name)
+    if not project_name:
+        return None, "⚠️ Select an incomplete project, or wait for an active job to stop."
+    return generate_epub_audiobook(
+        epub_path, audio_prompt_path, exaggeration, cfg_weight, temperature,
+        seed_num, diffusion_steps, min_p, top_p, repetition_penalty, max_chars,
+        batch_size, denoise_reference, project_name, progress,
+    )
+
+
 def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weight,
                             temperature, seed_num, diffusion_steps, min_p,
                             top_p, repetition_penalty, max_chars, batch_size,
                             denoise_reference, resume_project_name,
                             progress=gr.Progress()):
     resuming = bool(resume_project_name)
+    job_started, _ = job_status.try_start(project_id=resume_project_name or None)
+    if not job_started:
+        return None, "⚠️ Another audiobook job is already running."
+    generation_control.begin()
     if resuming:
         try:
             resume_dir, _ = load_project_metadata(OUTPUT_ROOT, resume_project_name)
@@ -1024,10 +1108,16 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
                 or (str(saved_reference) if saved_reference else None)
             )
         except ResumeProjectError as error:
+            job_status.finish("failed", f"Could not resume selected project: {error}")
+            generation_control.finish()
             return None, f"❌ {error}."
     if not epub_path:
+        job_status.finish("failed", "No EPUB was available for this job.")
+        generation_control.finish()
         return None, "❌ Upload the original EPUB once so it can be saved with this project."
     if not audio_prompt_path:
+        job_status.finish("failed", "No reference audio was available for this job.")
+        generation_control.finish()
         return None, "❌ Upload or record reference audio once so it can be saved with this project."
 
     project_dir = None
@@ -1038,7 +1128,6 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
     audio_tasks = None
     persist_quality_scan_checkpoint = None
     active_project_model_id = global_model.model_id
-    generation_control.begin()
     try:
         book = load_epub(epub_path)
         source_epub_name = Path(epub_path).name
@@ -1119,6 +1208,14 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
             scheduled=durable_chunks,
         )
         write_project_progress(project_dir, durable_chunks, durable_chunks)
+        job_status.update(
+            phase="preparing",
+            message="Preparing audiobook generation…",
+            fraction=durable_chunks / len(chunks),
+            completed_chunks=durable_chunks,
+            total_chunks=len(chunks),
+            project_id=project_dir.name,
+        )
 
         batch_size = int(batch_size)
         remaining_chunks = chunks[durable_chunks:]
@@ -1180,7 +1277,18 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
                 scan_started,
                 cached_verified_chunks=cached_verified_chunks,
             )
+            job_status.update(
+                phase="scanning",
+                message="Validating existing audio chunks…",
+                fraction=0.0,
+                completed_chunks=0,
+                total_chunks=len(scan_indices),
+                realtime_speed=None,
+                eta_seconds=None,
+            )
             for scanned_chunks, chunk_index in enumerate(scan_indices, start=1):
+                if generation_control.stop_requested():
+                    raise GenerationStopped
                 chunk_path = chunks_dir / f"{chunk_index:06d}.wav"
                 issues = wav_generated_audio_issues(chunk_path, global_model.sr)
                 if issues:
@@ -1215,6 +1323,20 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
                         cached_verified_chunks=cached_verified_chunks,
                     )
                     last_scan_report_at = now
+                    elapsed_scan = now - scan_started
+                    eta_scan = (
+                        elapsed_scan * (len(scan_indices) - scanned_chunks) / scanned_chunks
+                        if scanned_chunks else None
+                    )
+                    job_status.update(
+                        phase="scanning",
+                        message="Validating existing audio chunks…",
+                        fraction=scanned_chunks / len(scan_indices) if scan_indices else 1.0,
+                        completed_chunks=scanned_chunks,
+                        total_chunks=len(scan_indices),
+                        realtime_speed=None,
+                        eta_seconds=eta_scan,
+                    )
                     if should_log:
                         last_logged_scan_count = scanned_chunks
             persist_quality_scan_checkpoint(force=True)
@@ -1260,6 +1382,13 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
                 else f"{len(damaged_chunks):,} damaged chunks"
             )
             progress(0, desc=f"Preparing voice for {pending_description}")
+            job_status.update(
+                phase="preparing",
+                message=f"Preparing voice for {pending_description}",
+                completed_chunks=durable_chunks,
+                total_chunks=len(chunks),
+                fraction=durable_chunks / len(chunks),
+            )
             s3gen_ref, cond_emb = global_model.get_audio_conditionals(
                 audio_prompt_path,
                 denoise_reference=bool(denoise_reference),
@@ -1273,7 +1402,19 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
             progress(0.975, desc="All speech chunks found; preparing M4B assembly")
         repaired_chunks = []
         retained_noisy_chunks = []
-        for chunk_index in damaged_chunks:
+        if damaged_chunks:
+            job_status.update(
+                phase="repairing",
+                message="Regenerating damaged audio chunks…",
+                completed_chunks=0,
+                total_chunks=len(damaged_chunks),
+                fraction=0.0,
+                realtime_speed=None,
+                eta_seconds=None,
+            )
+        for repair_number, chunk_index in enumerate(damaged_chunks, start=1):
+            if generation_control.stop_requested():
+                raise GenerationStopped
             chunk = chunks[chunk_index]
             repair_args = dict(settings)
             retry_seeds: set[int] = set()
@@ -1343,6 +1484,13 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
                     color="red",
                 )
             repaired_chunks.append(chunk_index)
+            job_status.update(
+                phase="repairing",
+                message="Regenerating damaged audio chunks…",
+                completed_chunks=repair_number,
+                total_chunks=len(damaged_chunks),
+                fraction=repair_number / len(damaged_chunks),
+            )
             if not saved_issues and not recovery.retained_with_warning:
                 identity = wav_file_identity(repaired_path)
                 if identity is not None and verified_clean_chunks.get(chunk_index) != identity:
@@ -1387,7 +1535,18 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
                 ),
             )
         if durable_chunks and maximum_internal_pause_seconds is not None:
+            job_status.update(
+                phase="pause_processing",
+                message="Applying internal pause limit to existing audio…",
+                completed_chunks=0,
+                total_chunks=durable_chunks,
+                fraction=0.0,
+                realtime_speed=None,
+                eta_seconds=None,
+            )
             for chunk_index in range(durable_chunks):
+                if generation_control.stop_requested():
+                    raise GenerationStopped
                 if chunk_index in damaged_chunks:
                     continue
                 audio_tasks.submit(
@@ -1407,6 +1566,15 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
             # that, leave the latest speed/ETA visible while the next batch runs;
             # replacing it here made the useful metrics flash too briefly to see.
             if start == durable_chunks:
+                job_status.update(
+                    phase="generating",
+                    message="Generating speech chunks…",
+                    completed_chunks=completed_chunks,
+                    total_chunks=len(chunks),
+                    fraction=completed_chunks / len(chunks),
+                    realtime_speed=None,
+                    eta_seconds=None,
+                )
                 progress(
                     0,
                     desc=(
@@ -1525,11 +1693,29 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
                     f"ETA {format_duration(estimate.eta_seconds)}"
                 ),
             )
+            job_status.update(
+                phase="generating",
+                message="Generating speech chunks…",
+                completed_chunks=completed_chunks,
+                total_chunks=len(chunks),
+                fraction=completed_chunks / len(chunks),
+                realtime_speed=estimate.realtime_speed,
+                eta_seconds=estimate.eta_seconds,
+            )
             if generation_control.stop_requested():
                 raise GenerationStopped
 
         if audio_tasks is not None:
             progress(0.975, desc="Finishing background audio processing")
+            job_status.update(
+                phase="pause_processing",
+                message="Finishing background audio processing…",
+                completed_chunks=0,
+                total_chunks=durable_chunks,
+                fraction=0.975,
+                realtime_speed=None,
+                eta_seconds=None,
+            )
             audio_tasks.finish()
             durable_chunks, checkpoint_change_count = _record_durable_results(
                 audio_tasks,
@@ -1540,6 +1726,13 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
             if checkpoint_change_count:
                 checkpoint_dirty_chunks += checkpoint_change_count
             audio_tasks = None
+            job_status.update(
+                phase="pause_processing",
+                message="Background audio processing complete.",
+                completed_chunks=durable_chunks,
+                total_chunks=durable_chunks,
+                fraction=0.975,
+            )
         persist_quality_scan_checkpoint(force=True)
         _log_project_quality_summary(
             len(chunks),
@@ -1553,6 +1746,15 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
         )
         write_project_progress(project_dir, len(chunks), len(chunks))
         progress(0.98, desc="Preparing parallel M4B encoding")
+        job_status.update(
+            phase="encoding",
+            message="Preparing M4B encoding…",
+            completed_chunks=len(chunks),
+            total_chunks=len(chunks),
+            fraction=0.98,
+            realtime_speed=None,
+            eta_seconds=None,
+        )
 
         def report_assembly(update: AssemblyProgress) -> None:
             if update.phase == "encoding":
@@ -1569,6 +1771,15 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
                     f"ETA {format_duration(update.eta_seconds)}"
                 ),
             )
+            job_status.update(
+                phase=update.phase,
+                message=operation,
+                completed_chunks=len(chunks),
+                total_chunks=len(chunks),
+                fraction=min(0.999, position),
+                realtime_speed=update.realtime_speed,
+                eta_seconds=update.eta_seconds,
+            )
 
         output_path = assemble_audiobook(
             project_dir,
@@ -1580,6 +1791,15 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
             ffmpeg=ffmpeg,
         )
         progress(0.999, desc="Verifying completed M4B")
+        job_status.update(
+            phase="finalizing",
+            message="Verifying completed M4B…",
+            completed_chunks=len(chunks),
+            total_chunks=len(chunks),
+            fraction=0.999,
+            realtime_speed=None,
+            eta_seconds=None,
+        )
         final_audio_seconds = verify_m4b(output_path)
         delete_intermediate_chunks(project_dir)
         relative_output = output_path.relative_to(Path(__file__).resolve().parent).as_posix()
@@ -1604,6 +1824,14 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
             OUTPUT_ROOT,
             gr.set_static_paths,
         )
+        job_status.finish(
+            "completed",
+            "Audiobook complete.",
+            completed_chunks=len(chunks),
+            total_chunks=len(chunks),
+            fraction=1.0,
+            realtime_speed=final_speed,
+        )
         return str(output_path), (
             f"✅ **{book.title}** complete: {len(book.chapters)} chapters and "
             f"{len(chunks):,} speech chunks. Generated "
@@ -1626,6 +1854,13 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
                 f"EPUB generation stopped with {durable_chunks} of "
                 f"{len(chunks)} chunks safely recorded"
             )
+            job_status.finish(
+                "stopped",
+                "Generation stopped; the saved project can be resumed.",
+                completed_chunks=durable_chunks,
+                total_chunks=len(chunks),
+                fraction=durable_chunks / len(chunks) if chunks else 0.0,
+            )
             return None, (
                 f"⏹️ Generation stopped with {durable_chunks:,} of "
                 f"{len(chunks):,} chunks safely recorded. The project, saved inputs, "
@@ -1633,6 +1868,13 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
             )
         except Exception as progress_error:
             traceback.print_exc()
+            job_status.finish(
+                "stopped",
+                "Generation stopped; the saved project can be resumed.",
+                completed_chunks=completed_chunks,
+                total_chunks=len(chunks),
+                fraction=completed_chunks / len(chunks) if chunks else 0.0,
+            )
             return None, (
                 f"⚠️ Generation stopped and project files were preserved, but its "
                 f"progress record could not be updated: {progress_error}"
@@ -1642,6 +1884,13 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
             audio_tasks.cancel_and_wait()
             audio_tasks = None
         traceback.print_exc()
+        job_status.finish(
+            "failed",
+            f"Generation failed: {error}",
+            completed_chunks=completed_chunks,
+            total_chunks=len(chunks),
+            fraction=completed_chunks / len(chunks) if chunks else 0.0,
+        )
         if isinstance(error, MemoryPressureError):
             return None, f"⚠️ {error}. Partial files remain in `{project_dir}`."
         location = f" Partial files remain in `{project_dir}`." if project_dir else ""
@@ -1657,7 +1906,7 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
         generation_control.finish()
 
 
-with gr.Blocks(title="Chatterbox vLLM Audiobook") as demo:
+with gr.Blocks(title="Chatterbox vLLM Audiobook", css=JOB_MONITOR_CSS) as demo:
     gr.Markdown(
         "# Chatterbox vLLM\n"
         "Quick voice tests and batched EPUB audiobook generation.  \n"
@@ -1750,9 +1999,13 @@ with gr.Blocks(title="Chatterbox vLLM Audiobook") as demo:
                     )
                 with gr.Row():
                     epub_btn = gr.Button("Generate EPUB Audiobook", variant="primary")
-                    resume_epub_btn = gr.Button("Resume Selected Project")
+                    resume_epub_btn = gr.Button("Resume Selected / Monitored Project")
                     stop_epub_btn = gr.Button("Stop Generation", variant="stop")
                 epub_status = gr.Markdown("")
+                job_monitor = gr.HTML(
+                    render_job_status(job_status.snapshot(), format_duration=format_duration),
+                    elem_id="active-job-monitor",
+                )
                 epub_result_status = gr.State("")
                 new_project_state = gr.State("")
                 epub_audio_output = gr.Audio(label="Completed Audiobook (M4B)")
@@ -1765,6 +2018,18 @@ with gr.Blocks(title="Chatterbox vLLM Audiobook") as demo:
                 )
                 run_btn = gr.Button("Generate Sample", variant="primary")
                 audio_output = gr.Audio(label="Output Audio")
+
+    job_monitor_timer = gr.Timer(1.5)
+    demo.load(
+        fn=_job_monitor_render,
+        outputs=[job_monitor, stop_epub_btn, epub_btn, resume_epub_btn],
+        queue=False,
+    )
+    job_monitor_timer.tick(
+        fn=_job_monitor_render,
+        outputs=[job_monitor, stop_epub_btn, epub_btn, resume_epub_btn],
+        queue=False,
+    )
 
     ref_wav.input(
         fn=prepare_uploaded_reference,
@@ -1808,7 +2073,7 @@ with gr.Blocks(title="Chatterbox vLLM Audiobook") as demo:
         outputs=[epub_audio_output, epub_result_status],
     )
     resume_generation_event = resume_epub_btn.click(
-        fn=generate_epub_audiobook,
+        fn=resume_epub_audiobook,
         inputs=[
             epub_file, reference_source, exaggeration, cfg_weight, temp, seed_num,
             diffusion_steps, min_p, top_p, repetition_penalty, max_chars,

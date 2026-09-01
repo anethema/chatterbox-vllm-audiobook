@@ -86,6 +86,105 @@ class GradioReferencePreviewTests(unittest.TestCase):
         self.assertEqual(gradio_tts_app.repetition_penalty.value, 1.2)
         self.assertFalse(gradio_tts_app.denoise_reference.value)
 
+    def test_monitored_resume_prefers_selected_project(self):
+        from chatterbox_vllm.job_status import JobStatusStore
+
+        with tempfile.TemporaryDirectory() as directory:
+            old_status = gradio_tts_app.job_status
+            try:
+                gradio_tts_app.job_status = JobStatusStore(directory)
+                gradio_tts_app.job_status.try_start(project_id="monitored-project")
+                gradio_tts_app.job_status.finish("stopped", "ready")
+                self.assertEqual(
+                    gradio_tts_app._monitored_resume_project_name("selected-project"),
+                    "selected-project",
+                )
+            finally:
+                gradio_tts_app.job_status = old_status
+
+    def test_monitored_resume_uses_only_terminal_resumable_state(self):
+        from chatterbox_vllm.job_status import JobStatusStore
+
+        old_status = gradio_tts_app.job_status
+        try:
+            for state in ("stopped", "interrupted", "failed"):
+                with self.subTest(state=state), tempfile.TemporaryDirectory() as directory:
+                    store = JobStatusStore(directory)
+                    store.try_start(project_id="monitored-project")
+                    store.finish(state, "ready")
+                    gradio_tts_app.job_status = store
+                    self.assertEqual(
+                        gradio_tts_app._monitored_resume_project_name(None),
+                        "monitored-project",
+                    )
+            for state in ("running", "stopping", "completed", "idle"):
+                with self.subTest(state=state), tempfile.TemporaryDirectory() as directory:
+                    store = JobStatusStore(directory)
+                    if state != "idle":
+                        store.try_start(project_id="monitored-project")
+                    if state == "stopping":
+                        store.request_stop()
+                    elif state == "completed":
+                        store.finish("completed", "done")
+                    gradio_tts_app.job_status = store
+                    self.assertIsNone(gradio_tts_app._monitored_resume_project_name(None))
+        finally:
+            gradio_tts_app.job_status = old_status
+
+    def test_missing_inputs_release_job_control_and_publish_failure(self):
+        from chatterbox_vllm.job_status import JobStatusStore
+        from chatterbox_vllm.progress import GenerationControl
+
+        with tempfile.TemporaryDirectory() as directory:
+            old_status = gradio_tts_app.job_status
+            old_control = gradio_tts_app.generation_control
+            try:
+                gradio_tts_app.job_status = JobStatusStore(directory)
+                gradio_tts_app.generation_control = GenerationControl()
+                output, message = gradio_tts_app.generate_epub_audiobook(
+                    None, None, 0.5, 0.5, 0.8, 0, 15, 0.05, 1.0, 1.2,
+                    200, 64, False, None, progress=Mock(),
+                )
+
+                self.assertIsNone(output)
+                self.assertIn("Upload the original EPUB", message)
+                self.assertEqual(gradio_tts_app.job_status.snapshot().state, "failed")
+                self.assertFalse(gradio_tts_app.generation_control.request_stop())
+            finally:
+                gradio_tts_app.job_status = old_status
+                gradio_tts_app.generation_control = old_control
+
+    def test_job_monitor_poll_renders_progress_and_control_state(self):
+        from chatterbox_vllm.job_status import JobStatusStore
+        from chatterbox_vllm.progress import GenerationControl
+
+        with tempfile.TemporaryDirectory() as directory:
+            old_status = gradio_tts_app.job_status
+            old_control = gradio_tts_app.generation_control
+            try:
+                gradio_tts_app.job_status = JobStatusStore(directory)
+                gradio_tts_app.generation_control = GenerationControl()
+                gradio_tts_app.job_status.try_start(project_id="resume-token")
+                gradio_tts_app.job_status.update(
+                    fraction=0.25, completed_chunks=25, total_chunks=100,
+                )
+                monitor, stop, generate, resume = gradio_tts_app._job_monitor_render()
+                self.assertIn("25/100 chunks", monitor)
+                self.assertIn('style="width: 25.0%"', monitor)
+                self.assertEqual(gradio_tts_app.job_monitor.elem_id, "active-job-monitor")
+                self.assertFalse(hasattr(gradio_tts_app, "job_monitor_progress"))
+                self.assertTrue(stop.interactive)
+                self.assertFalse(generate.interactive)
+                self.assertFalse(resume.interactive)
+
+                gradio_tts_app.generation_control.begin()
+                message = gradio_tts_app.request_generation_stop()
+                self.assertIn("Stop requested", message)
+                self.assertEqual(gradio_tts_app.job_status.snapshot().state, "stopping")
+            finally:
+                gradio_tts_app.job_status = old_status
+                gradio_tts_app.generation_control = old_control
+
 
 class ResumeScanProgressTests(unittest.TestCase):
     def test_progress_message_includes_count_percentage_and_eta(self):
