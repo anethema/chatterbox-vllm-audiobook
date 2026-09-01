@@ -36,6 +36,130 @@ PROJECT_INPUTS_DIRECTORY = "inputs"
 PROJECT_EPUB_NAME = "source.epub"
 REFERENCE_AUDIO_PREFIX = "reference-audio"
 PROJECT_PROGRESS_NAME = "progress.json"
+PROJECT_QUALITY_SCAN_NAME = "quality-scan.json"
+QUALITY_SCAN_CHECKPOINT_SCHEMA_VERSION = 1
+QUALITY_SCAN_DETECTOR_VERSION = 1
+
+
+def wav_file_identity(path: str | Path) -> dict[str, int] | None:
+    """Return the inexpensive identity used to validate a scanned WAV later."""
+
+    try:
+        status = Path(path).stat()
+    except OSError:
+        return None
+    if not Path(path).is_file():
+        return None
+    return {"size": int(status.st_size), "mtime_ns": int(status.st_mtime_ns)}
+
+
+def _parse_quality_scan_checkpoint(data: object) -> dict[int, dict[str, int]]:
+    """Read a strict quality-scan cache, failing safely on malformed data."""
+
+    if not isinstance(data, dict):
+        return {}
+    if set(data) != {
+        "schema_version",
+        "detector_version",
+        "verified_clean_chunks",
+    }:
+        return {}
+    if data.get("schema_version") != QUALITY_SCAN_CHECKPOINT_SCHEMA_VERSION:
+        return {}
+    if data.get("detector_version") != QUALITY_SCAN_DETECTOR_VERSION:
+        return {}
+    raw_verified = data.get("verified_clean_chunks")
+    if not isinstance(raw_verified, dict):
+        return {}
+
+    verified: dict[int, dict[str, int]] = {}
+    for raw_index, raw_identity in raw_verified.items():
+        if (
+            not isinstance(raw_index, str)
+            or not raw_index.isdecimal()
+            or not isinstance(raw_identity, dict)
+            or set(raw_identity) != {"size", "mtime_ns"}
+        ):
+            return {}
+        size = raw_identity["size"]
+        mtime_ns = raw_identity["mtime_ns"]
+        if (
+            isinstance(size, bool)
+            or isinstance(mtime_ns, bool)
+            or not isinstance(size, int)
+            or not isinstance(mtime_ns, int)
+            or size <= 0
+            or mtime_ns < 0
+        ):
+            return {}
+        verified[int(raw_index)] = {"size": size, "mtime_ns": mtime_ns}
+    return verified
+
+
+def load_quality_scan_checkpoint(project_dir: str | Path) -> dict[int, dict[str, int]]:
+    """Load verified-clean chunk identities, or an empty cache if unsafe to use."""
+
+    progress_path = Path(project_dir) / PROJECT_QUALITY_SCAN_NAME
+    try:
+        data = json.loads(progress_path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return _parse_quality_scan_checkpoint(data)
+
+
+def quality_scan_checkpoint_entry_matches(
+    checkpoint: dict[int, dict[str, int]],
+    chunk_index: int,
+    path: str | Path,
+) -> bool:
+    """Whether a saved clean result still belongs to this exact WAV file."""
+
+    identity = wav_file_identity(path)
+    return identity is not None and checkpoint.get(int(chunk_index)) == identity
+
+
+def write_quality_scan_checkpoint(
+    project_dir: str | Path,
+    verified_clean_chunks: dict[int, dict[str, int]],
+) -> Path:
+    """Atomically persist clean WAV identities verified by the current detector."""
+
+    project = Path(project_dir)
+    checkpoint_path = project / PROJECT_QUALITY_SCAN_NAME
+    temporary = project / f".{PROJECT_QUALITY_SCAN_NAME}-{uuid4().hex}.tmp"
+    clean_entries = {
+        f"{index:06d}": identity
+        for index, identity in sorted(verified_clean_chunks.items())
+        if (
+            isinstance(index, int)
+            and index >= 0
+            and isinstance(identity, dict)
+            and set(identity) == {"size", "mtime_ns"}
+            and isinstance(identity["size"], int)
+            and not isinstance(identity["size"], bool)
+            and identity["size"] > 0
+            and isinstance(identity["mtime_ns"], int)
+            and not isinstance(identity["mtime_ns"], bool)
+            and identity["mtime_ns"] >= 0
+        )
+    }
+    data = {
+        "schema_version": QUALITY_SCAN_CHECKPOINT_SCHEMA_VERSION,
+        "detector_version": QUALITY_SCAN_DETECTOR_VERSION,
+        "verified_clean_chunks": clean_entries,
+    }
+    try:
+        temporary.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        os.replace(temporary, checkpoint_path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return checkpoint_path
+
+
+def delete_quality_scan_checkpoint(project_dir: str | Path) -> None:
+    """Remove resumable scan metadata after a project is fully assembled."""
+
+    (Path(project_dir) / PROJECT_QUALITY_SCAN_NAME).unlink(missing_ok=True)
 
 
 def project_model_id(metadata: dict) -> str:

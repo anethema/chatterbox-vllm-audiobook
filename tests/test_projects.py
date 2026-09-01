@@ -9,10 +9,15 @@ from chatterbox_vllm.epub import EpubBook, EpubChapter, chunk_book
 from chatterbox_vllm.projects import (
     ResumeProjectError,
     build_resume_plan,
+    delete_quality_scan_checkpoint,
     incomplete_project_choices,
+    load_quality_scan_checkpoint,
     load_project_metadata,
     persist_project_inputs,
     saved_project_inputs,
+    quality_scan_checkpoint_entry_matches,
+    wav_file_identity,
+    write_quality_scan_checkpoint,
     write_project_progress,
 )
 from chatterbox_vllm.model_variants import (
@@ -221,6 +226,123 @@ class ResumeProjectTests(unittest.TestCase):
         self.assertEqual(metadata["completed_chunks"], 7)
         self.assertEqual(metadata["scheduled_chunks"], 8)
         self.assertLess(progress_size, 200)
+
+    def test_legacy_project_without_quality_checkpoint_rescans_safely(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = self.make_project(root)
+            chunk_path = project / "chunks" / "000000.wav"
+            write_wav(chunk_path)
+
+            checkpoint = load_quality_scan_checkpoint(project)
+
+        self.assertEqual(checkpoint, {})
+        self.assertFalse(
+            quality_scan_checkpoint_entry_matches(checkpoint, 0, chunk_path)
+        )
+
+    def test_unchanged_verified_chunk_is_safe_to_skip(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = self.make_project(root)
+            chunk_path = project / "chunks" / "000000.wav"
+            write_wav(chunk_path)
+            identity = wav_file_identity(chunk_path)
+            self.assertIsNotNone(identity)
+            write_quality_scan_checkpoint(project, {0: identity})
+
+            checkpoint = load_quality_scan_checkpoint(project)
+            matches = quality_scan_checkpoint_entry_matches(checkpoint, 0, chunk_path)
+
+        self.assertTrue(matches)
+
+    def test_changed_verified_chunk_is_rescanned(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = self.make_project(root)
+            chunk_path = project / "chunks" / "000000.wav"
+            write_wav(chunk_path)
+            identity = wav_file_identity(chunk_path)
+            self.assertIsNotNone(identity)
+            write_quality_scan_checkpoint(project, {0: identity})
+            write_wav(chunk_path)
+            os.utime(chunk_path, ns=(2_000_000_000, 2_000_000_000))
+
+            checkpoint = load_quality_scan_checkpoint(project)
+            matches = quality_scan_checkpoint_entry_matches(checkpoint, 0, chunk_path)
+
+        self.assertFalse(matches)
+
+    def test_missing_verified_chunk_is_rescanned(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = self.make_project(root)
+            chunk_path = project / "chunks" / "000000.wav"
+            write_wav(chunk_path)
+            identity = wav_file_identity(chunk_path)
+            self.assertIsNotNone(identity)
+            write_quality_scan_checkpoint(project, {0: identity})
+            chunk_path.unlink()
+
+            checkpoint = load_quality_scan_checkpoint(project)
+            matches = quality_scan_checkpoint_entry_matches(checkpoint, 0, chunk_path)
+
+        self.assertFalse(matches)
+
+    def test_only_verified_new_or_repaired_chunks_are_persisted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = self.make_project(root)
+            new_path = project / "chunks" / "000000.wav"
+            repaired_path = project / "chunks" / "000001.wav"
+            write_wav(new_path)
+            write_wav(repaired_path)
+            write_quality_scan_checkpoint(
+                project,
+                {
+                    0: wav_file_identity(new_path),
+                    1: wav_file_identity(repaired_path),
+                    # A noisy/retained chunk is deliberately absent.
+                },
+            )
+            checkpoint = load_quality_scan_checkpoint(project)
+
+        self.assertEqual(set(checkpoint), {0, 1})
+        self.assertNotIn(2, checkpoint)
+
+    def test_malformed_or_stale_quality_checkpoint_fails_safe(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = self.make_project(root)
+            checkpoint_path = project / "quality-scan.json"
+            checkpoint_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "detector_version": 999,
+                        "verified_clean_chunks": {"000000": {"size": 1}},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            checkpoint = load_quality_scan_checkpoint(project)
+
+        self.assertEqual(checkpoint, {})
+
+    def test_completed_project_cleanup_removes_quality_checkpoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = self.make_project(root)
+            chunk_path = project / "chunks" / "000000.wav"
+            write_wav(chunk_path)
+            identity = wav_file_identity(chunk_path)
+            self.assertIsNotNone(identity)
+            write_quality_scan_checkpoint(project, {0: identity})
+
+            delete_quality_scan_checkpoint(project)
+            checkpoint = load_quality_scan_checkpoint(project)
+
+        self.assertEqual(checkpoint, {})
 
 
 if __name__ == "__main__":

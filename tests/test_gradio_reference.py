@@ -4,7 +4,8 @@ import io
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+import wave
 
 import numpy as np
 import torch
@@ -84,6 +85,99 @@ class GradioReferencePreviewTests(unittest.TestCase):
         self.assertEqual(gradio_tts_app.top_p.value, 1.0)
         self.assertEqual(gradio_tts_app.repetition_penalty.value, 1.2)
         self.assertFalse(gradio_tts_app.denoise_reference.value)
+
+
+class ResumeScanProgressTests(unittest.TestCase):
+    def test_progress_message_includes_count_percentage_and_eta(self):
+        message = gradio_tts_app._resume_scan_progress_message(25, 100, 10)
+
+        self.assertEqual(
+            message,
+            "[Audio quality scan] Scanning existing chunks: 25/100 (25.0%) "
+            "— ETA 30s",
+        )
+
+    def test_initial_progress_uses_calculating_eta(self):
+        message = gradio_tts_app._resume_scan_progress_message(0, 29_056, 0)
+
+        self.assertIn("0/29,056 (0.0%)", message)
+        self.assertTrue(message.endswith("ETA calculating…"))
+
+    def test_fully_cached_scan_has_no_pending_eta(self):
+        message = gradio_tts_app._resume_scan_progress_message(
+            0, 0, 0, cached_verified_chunks=29_056,
+        )
+
+        self.assertIn("0/0 (100.0%) — ETA 0s", message)
+        self.assertTrue(message.endswith("skipped 29,056 cached verified"))
+
+    def test_reporting_updates_gradio_without_requiring_stdout(self):
+        progress = Mock()
+        with patch.object(gradio_tts_app.time, "perf_counter", return_value=18):
+            with patch.object(gradio_tts_app, "_quality_log") as quality_log:
+                gradio_tts_app._report_resume_scan_progress(
+                    progress, 40, 100, started_at=10, log_stdout=False,
+                )
+
+        progress.assert_called_once_with(
+            0.4,
+            desc=(
+                "[Audio quality scan] Scanning existing chunks: 40/100 (40.0%) "
+                "— ETA 12s"
+            ),
+        )
+        quality_log.assert_not_called()
+
+
+class QualityScanCheckpointRecordingTests(unittest.TestCase):
+    class CompletedTasks:
+        def __init__(self, results):
+            self.results = list(results)
+
+        def check(self):
+            return None
+
+        def take_results(self):
+            results = self.results
+            self.results = []
+            return results
+
+    @staticmethod
+    def _write_wav(path: Path) -> None:
+        with wave.open(str(path), "wb") as audio:
+            audio.setnchannels(1)
+            audio.setsampwidth(2)
+            audio.setframerate(24_000)
+            audio.writeframes(b"\0\0" * 100)
+
+    def test_only_verified_final_background_output_is_cached(self):
+        with tempfile.TemporaryDirectory() as directory:
+            chunk_path = Path(directory) / "000000.wav"
+            self._write_wav(chunk_path)
+            verified = {}
+            durable, changes = gradio_tts_app._record_durable_results(
+                self.CompletedTasks(
+                    [gradio_tts_app.SavedChunkQuality(chunk_path, True)]
+                ),
+                set(),
+                0,
+                verified,
+            )
+
+            self.assertEqual((durable, changes), (1, 1))
+            self.assertIn(0, verified)
+
+            durable, changes = gradio_tts_app._record_durable_results(
+                self.CompletedTasks(
+                    [gradio_tts_app.SavedChunkQuality(chunk_path, False)]
+                ),
+                set(),
+                0,
+                verified,
+            )
+
+        self.assertEqual((durable, changes), (1, 1))
+        self.assertEqual(verified, {})
 
 
 class AudioRecoveryTests(unittest.TestCase):
