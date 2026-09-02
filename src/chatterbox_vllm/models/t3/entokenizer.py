@@ -1,8 +1,6 @@
 import logging
 import os
-from typing import List, Optional, Union
-
-import torch
+from typing import List
 from tokenizers import Tokenizer
 from transformers import PreTrainedTokenizer
 

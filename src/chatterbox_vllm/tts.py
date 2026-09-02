@@ -10,7 +10,6 @@ from functools import lru_cache
 
 import librosa
 import torch
-import torch.nn.functional as F
 from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file
 

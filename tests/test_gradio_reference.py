@@ -279,6 +279,173 @@ class QualityScanCheckpointRecordingTests(unittest.TestCase):
         self.assertEqual(verified, {})
 
 
+class ChunkPersistenceTests(unittest.TestCase):
+    sample_rate = 24_000
+
+    def test_minimum_duration_scales_with_word_count(self):
+        text = "one two three four five six seven eight nine ten"
+        too_short = torch.zeros((1, round(0.25 * self.sample_rate)))
+        with self.assertRaises(gradio_tts_app.GeneratedAudioValidationError):
+            gradio_tts_app._waveform_for_save(
+                too_short,
+                text,
+                self.sample_rate,
+                allow_quality_issues=True,
+            )
+
+        adequate = torch.zeros((1, round(0.45 * self.sample_rate)))
+        saved = gradio_tts_app._waveform_for_save(
+            adequate,
+            text,
+            self.sample_rate,
+            allow_quality_issues=True,
+        )
+        self.assertEqual(saved.shape, adequate.shape)
+
+    def test_failed_transform_keeps_previous_chunk_and_removes_staging_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "000000.wav"
+            path.write_bytes(b"previous")
+
+            def fake_save(temporary, *_args, **_kwargs):
+                Path(temporary).write_bytes(b"raw")
+
+            with patch.object(gradio_tts_app.ta, "save", side_effect=fake_save), patch.object(
+                gradio_tts_app,
+                "normalize_speech_wav",
+                side_effect=RuntimeError("normalization failed"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "normalization failed"):
+                    gradio_tts_app._save_and_normalize_chunk(
+                        path,
+                        torch.zeros((1, self.sample_rate)),
+                        self.sample_rate,
+                        "ffmpeg",
+                        None,
+                    )
+
+            self.assertEqual(path.read_bytes(), b"previous")
+            self.assertEqual(list(Path(directory).iterdir()), [path])
+
+    def test_staged_chunk_replaces_final_only_after_all_transforms(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "000000.wav"
+            path.write_bytes(b"previous")
+            staged_paths = []
+
+            def fake_save(temporary, *_args, **_kwargs):
+                staged = Path(temporary)
+                staged_paths.append(staged)
+                staged.write_bytes(b"raw")
+
+            def fake_normalize(temporary, *_args, **_kwargs):
+                self.assertEqual(path.read_bytes(), b"previous")
+                with Path(temporary).open("ab") as audio:
+                    audio.write(b"-normalized")
+
+            def fake_limit(temporary, *_args, **_kwargs):
+                self.assertEqual(path.read_bytes(), b"previous")
+                with Path(temporary).open("ab") as audio:
+                    audio.write(b"-paused")
+
+            with patch.object(gradio_tts_app.ta, "save", side_effect=fake_save), patch.object(
+                gradio_tts_app, "normalize_speech_wav", side_effect=fake_normalize
+            ), patch.object(
+                gradio_tts_app, "limit_internal_pauses_wav", side_effect=fake_limit
+            ):
+                gradio_tts_app._save_and_normalize_chunk(
+                    path,
+                    torch.zeros((1, self.sample_rate)),
+                    self.sample_rate,
+                    "ffmpeg",
+                    0.5,
+                )
+
+            self.assertEqual(path.read_bytes(), b"raw-normalized-paused")
+            self.assertEqual(len(staged_paths), 1)
+            self.assertEqual(staged_paths[0].parent, path.parent)
+            self.assertFalse(staged_paths[0].exists())
+
+    def test_cacheability_requires_a_clean_final_wav_scan(self):
+        path = Path("000000.wav")
+        issue = gradio_tts_app.AudioQualityIssue("artifact", 0.0, 1.0)
+        with patch.object(gradio_tts_app, "_save_and_normalize_chunk"), patch.object(
+            gradio_tts_app, "wav_generated_audio_issues", return_value=[issue]
+        ) as scan:
+            result = gradio_tts_app._save_normalize_and_record_chunk(
+                path,
+                torch.zeros((1, self.sample_rate)),
+                self.sample_rate,
+                "ffmpeg",
+                None,
+                cacheable=True,
+            )
+
+        self.assertFalse(result.verified_clean)
+        scan.assert_called_once_with(path, self.sample_rate)
+
+    def test_completion_metadata_is_written_before_best_effort_chunk_cleanup(self):
+        events = []
+        with tempfile.TemporaryDirectory() as directory:
+            project_dir = Path(directory)
+            metadata_path = project_dir / "metadata.json"
+            with patch.object(
+                gradio_tts_app,
+                "_write_metadata",
+                side_effect=lambda *_args, **_kwargs: events.append("metadata"),
+            ), patch.object(
+                gradio_tts_app,
+                "delete_quality_scan_checkpoint",
+                side_effect=lambda _path: events.append("checkpoint"),
+            ), patch.object(
+                gradio_tts_app,
+                "delete_intermediate_chunks",
+                side_effect=lambda _path: events.append("chunks"),
+            ):
+                gradio_tts_app._mark_verified_project_complete(
+                    metadata_path,
+                    project_dir,
+                    Mock(),
+                    "book.epub",
+                    [],
+                    {},
+                    "model",
+                    "book.m4b",
+                )
+
+        self.assertEqual(events, ["metadata", "checkpoint", "chunks"])
+
+    def test_metadata_failure_prevents_all_project_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project_dir = Path(directory)
+            metadata_path = project_dir / "metadata.json"
+            with patch.object(
+                gradio_tts_app,
+                "_write_metadata",
+                side_effect=OSError("disk full"),
+            ), patch.object(
+                gradio_tts_app,
+                "delete_quality_scan_checkpoint",
+            ) as delete_checkpoint, patch.object(
+                gradio_tts_app,
+                "delete_intermediate_chunks",
+            ) as delete_chunks:
+                with self.assertRaisesRegex(OSError, "disk full"):
+                    gradio_tts_app._mark_verified_project_complete(
+                        metadata_path,
+                        project_dir,
+                        Mock(),
+                        "book.epub",
+                        [],
+                        {},
+                        "model",
+                        "book.m4b",
+                    )
+
+            delete_checkpoint.assert_not_called()
+            delete_chunks.assert_not_called()
+
+
 class AudioRecoveryTests(unittest.TestCase):
     sample_rate = 24000
 
@@ -313,6 +480,9 @@ class AudioRecoveryTests(unittest.TestCase):
     def truncated_audio(self):
         # This is the exact duration in the reported "asked Vess." failure.
         return torch.zeros((1, round(0.04 * self.sample_rate)), dtype=torch.float32)
+
+    def excessive_silence_audio(self):
+        return torch.zeros((1, 9 * self.sample_rate), dtype=torch.float32)
 
     def test_two_word_truncation_retries_the_entire_chunk(self):
         retry_calls = []
@@ -422,6 +592,23 @@ class AudioRecoveryTests(unittest.TestCase):
             ),
             [],
         )
+
+    def test_near_silent_chunk_retries_the_entire_chunk(self):
+        retry_calls = []
+
+        recovery = gradio_tts_app._recover_generated_waveform(
+            self.excessive_silence_audio(),
+            "This ordinary test sentence has enough words to permit a normal duration.",
+            self.sample_rate,
+            "chunk 000124",
+            lambda: (retry_calls.append("retry") or self.good_audio()),
+            lambda part: self.good_audio(),
+        )
+
+        self.assertEqual(retry_calls, ["retry"])
+        self.assertTrue(recovery.detected_quality_issues)
+        self.assertFalse(recovery.retained_with_warning)
+        self.assertEqual(recovery.retained_quality_issues, ())
 
     def test_clean_waveform_is_not_marked_as_repaired_or_retained(self):
         recovery = gradio_tts_app._recover_generated_waveform(

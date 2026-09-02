@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from fractions import Fraction
 import json
 import math
 import os
@@ -64,6 +65,9 @@ class _RunningEncoder:
     error_path: Path
     progress_handle: object
     error_handle: object
+
+
+_CHAPTER_TIMESTAMP_TOLERANCE_SECONDS = 0.001
 
 
 def delete_intermediate_chunks(project_dir: str | Path) -> None:
@@ -139,23 +143,34 @@ def verify_m4b(
                 "The completed M4B duration differs from its source audio "
                 f"({duration:.2f}s instead of {expected_duration_seconds:.2f}s)"
             )
+    chapters = probe.get("chapters", [])
+    if not isinstance(chapters, list):
+        raise RuntimeError("The completed M4B has invalid chapter timestamps")
     if expected_chapters is not None:
-        chapters = probe.get("chapters", [])
         if len(chapters) != expected_chapters:
             raise RuntimeError(
                 "The completed M4B has the wrong chapter count "
                 f"({len(chapters)} instead of {expected_chapters})"
             )
-        previous_start = -1.0
-        for chapter in chapters:
-            try:
-                start = float(chapter["start_time"])
-                end = float(chapter["end_time"])
-            except (KeyError, TypeError, ValueError) as error:
-                raise RuntimeError("The completed M4B has invalid chapter timestamps") from error
-            if not math.isfinite(start) or not math.isfinite(end) or start < previous_start or end <= start:
-                raise RuntimeError("The completed M4B has invalid chapter timestamps")
-            previous_start = start
+    previous_end = 0.0
+    for chapter in chapters:
+        try:
+            start = float(chapter["start_time"])
+            end = float(chapter["end_time"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise RuntimeError("The completed M4B has invalid chapter timestamps") from error
+        if (
+            not math.isfinite(start)
+            or not math.isfinite(end)
+            or start < 0
+            or end < 0
+            or end <= start
+            or start < previous_end
+            or end < previous_end
+            or end > duration + _CHAPTER_TIMESTAMP_TOLERANCE_SECONDS
+        ):
+            raise RuntimeError("The completed M4B has invalid chapter timestamps")
+        previous_end = end
     return duration
 
 
@@ -251,24 +266,28 @@ def physical_core_cpu_ids(
     return tuple(available[::2]) or (available[0],)
 
 
-def _wav_duration_ms(path: Path) -> int:
+def _wav_duration(path: Path) -> tuple[int, Fraction]:
     try:
         with wave.open(str(path), "rb") as audio:
-            if audio.getnframes() <= 0 or audio.getframerate() <= 0:
+            frames = audio.getnframes()
+            sample_rate = audio.getframerate()
+            if frames <= 0 or sample_rate <= 0:
                 raise RuntimeError(f"Audio chunk is empty: {path}")
-            return round(audio.getnframes() * 1000 / audio.getframerate())
+            duration = Fraction(frames, sample_rate)
+            return round(duration * 1000), duration
     except (OSError, EOFError, wave.Error) as error:
         raise RuntimeError(f"Could not read audio chunk: {path}") from error
 
 
-def _write_silence(path: Path, sample_rate: int, duration_seconds: float) -> int:
+def _write_silence(path: Path, sample_rate: int, duration_seconds: float) -> tuple[int, Fraction]:
     frames = max(1, round(sample_rate * duration_seconds))
     with wave.open(str(path), "wb") as audio:
         audio.setnchannels(1)
         audio.setsampwidth(2)
         audio.setframerate(sample_rate)
         audio.writeframes(b"\0\0" * frames)
-    return round(frames * 1000 / sample_rate)
+    duration = Fraction(frames, sample_rate)
+    return round(duration * 1000), duration
 
 
 def build_audio_timeline(
@@ -285,37 +304,40 @@ def build_audio_timeline(
     assembly = Path(assembly_dir)
     short_pause = assembly / "pause-between-chunks.wav"
     chapter_pause = assembly / "pause-between-chapters.wav"
-    short_pause_ms = _write_silence(short_pause, sample_rate, 0.18)
-    chapter_pause_ms = _write_silence(chapter_pause, sample_rate, 0.9)
+    short_pause_ms, short_pause_duration = _write_silence(short_pause, sample_rate, 0.18)
+    chapter_pause_ms, chapter_pause_duration = _write_silence(chapter_pause, sample_rate, 0.9)
 
     entries: list[AudioEntry] = []
-    chapter_starts: list[tuple[str, int]] = []
-    timeline_ms = 0
+    chapter_starts: list[tuple[str, Fraction]] = []
+    timeline_duration = Fraction()
     for index, chunk in enumerate(chunks):
         chapter_changed = index == 0 or chunk.chapter_index != chunks[index - 1].chapter_index
         if chapter_changed:
-            chapter_starts.append((chunk.chapter_title, timeline_ms))
+            chapter_starts.append((chunk.chapter_title, timeline_duration))
         if index:
             if chapter_changed:
                 entries.append(AudioEntry(chapter_pause, chapter_pause_ms, True, True))
-                timeline_ms += chapter_pause_ms
+                timeline_duration += chapter_pause_duration
             else:
                 entries.append(AudioEntry(short_pause, short_pause_ms, False, True))
-                timeline_ms += short_pause_ms
+                timeline_duration += short_pause_duration
         chunk_path = project / "chunks" / f"{index:06d}.wav"
-        duration_ms = _wav_duration_ms(chunk_path)
+        duration_ms, duration = _wav_duration(chunk_path)
         entries.append(AudioEntry(chunk_path, duration_ms))
-        timeline_ms += duration_ms
+        timeline_duration += duration
 
     markers = [
         ChapterMarker(
             title,
-            start,
-            chapter_starts[index + 1][1] if index + 1 < len(chapter_starts) else timeline_ms,
+            round(start * 1000),
+            round(
+                (chapter_starts[index + 1][1] if index + 1 < len(chapter_starts) else timeline_duration)
+                * 1000
+            ),
         )
         for index, (title, start) in enumerate(chapter_starts)
     ]
-    return entries, markers, timeline_ms
+    return entries, markers, round(timeline_duration * 1000)
 
 
 def plan_encoding_segments(

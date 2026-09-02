@@ -14,6 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
+
 import torch
 
 '''
@@ -159,7 +161,10 @@ def add_optional_chunk_mask(xs: torch.Tensor,
         chunk_masks = masks
     assert chunk_masks.dtype == torch.bool
     if (chunk_masks.sum(dim=-1) == 0).sum().item() != 0:
-        logging.warning('get chunk_masks all false at some timestep, force set to true, make sure they are masked in futuer computation!')
+        logging.warning(
+            "get chunk_masks found an all-false timestep; forcing it true so "
+            "downstream computation can apply the intended mask"
+        )
         chunk_masks[chunk_masks.sum(dim=-1)==0] = True
     return chunk_masks
 

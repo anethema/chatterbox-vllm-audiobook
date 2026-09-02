@@ -25,7 +25,6 @@ from vllm.multimodal.processing import (
     PromptUpdate,
     MultiModalInputs,
     PlaceholderRange,
-    PromptUpdate,
 )
 from vllm.multimodal.profiling import BaseDummyInputsBuilder
 from vllm.sequence import IntermediateTensors

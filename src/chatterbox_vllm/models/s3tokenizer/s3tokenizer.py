@@ -1,4 +1,4 @@
-from typing import List, Tuple
+from typing import TYPE_CHECKING, List, Tuple
 
 import numpy as np
 import librosa
@@ -9,6 +9,9 @@ from s3tokenizer.model_v2 import (
     S3TokenizerV2,
     ModelConfig,
 )
+
+if TYPE_CHECKING:
+    from accelerate import Accelerator
 
 
 # Sampling rate of the inputs to S3TokenizerV2

@@ -94,6 +94,19 @@ class ResumeProjectTests(unittest.TestCase):
         self.assertEqual(plan.durable_chunks, 6)
         self.assertEqual(plan.resume_index, 4)
 
+    def test_resume_stops_before_a_wav_with_a_truncated_pcm_payload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = self.make_project(root)
+            first = project / "chunks" / "000000.wav"
+            write_wav(first)
+            first.write_bytes(first.read_bytes()[:-1])
+
+            plan = build_resume_plan(root, project.name, self.book, 24000)
+
+        self.assertEqual(plan.durable_chunks, 0)
+        self.assertEqual(plan.resume_index, 0)
+
     def test_resume_ignores_and_removes_temp_older_than_rebuilt_final(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

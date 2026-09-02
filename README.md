@@ -16,7 +16,7 @@ The web interface currently targets English narration and defaults to the pinned
 - Optional RNNoise reference denoising before two-pass loudness normalization
 - Exact processed-reference playback in the Gradio player
 - Conservative inference-only cleanup of troublesome EPUB punctuation, citations, and dotted initials
-- Full-waveform corruption scans using deterministic signal checks and CPU-based Silero VAD
+- Full-waveform corruption and excessive-silence scans using deterministic signal checks and CPU-based Silero VAD
 - Fresh-seed retry and bounded recursive text splitting when generated audio fails a quality scan
 - Colored per-batch and final quality summaries in the terminal
 - Reconnectable server-side progress with generated chunks, realtime speed, and ETA
@@ -200,7 +200,7 @@ Reference denoising is intentionally optional. It can help a quiet recording who
 
 Immediately before inference, the app conservatively removes unsupported quotation marks and decorative symbols, strips attached numeric citations, and spaces uppercase dotted initials such as <code>J.R.R.</code>. Ordinary punctuation, decimal numbers, abbreviations such as <code>p.m.</code>, and multilingual letters are retained. This cleanup affects only the text sent to the model; original EPUB text remains in project metadata.
 
-Every generated waveform is scanned before it is accepted. The scanner combines deterministic spectral checks with CPU-based Silero VAD to find audible non-speech blobs that may evade a simple tone detector. A failed chunk is regenerated once with a fresh random seed, then split into progressively smaller text if necessary. A repeatedly failing single sentence is retained with a red warning so an unattended project continues instead of stopping indefinitely. The terminal prints one green or red result for each batch and a colored detected/fixed/retained summary when the project finishes.
+Every generated waveform is scanned before it is accepted. The scanner combines deterministic spectral and silence checks with CPU-based Silero VAD to find audible non-speech blobs that may evade a simple tone detector. Wholly near-silent audio and at least three seconds of continuous leading or trailing near-silence are rejected, while ordinary short edge padding is preserved. A failed chunk is regenerated once with a fresh random seed, then split into progressively smaller text if necessary. A repeatedly failing single sentence is retained with a red warning so an unattended project continues instead of stopping indefinitely. The terminal prints one green or red result for each batch and a colored detected/fixed/retained summary when the project finishes.
 
 ## Output files
 
@@ -297,6 +297,7 @@ Run the unit suite without loading the model:
 
 ~~~bash
 .venv/bin/python -m unittest discover -v tests
+.venv/bin/ruff check gradio_tts_app.py src tests
 ~~~
 
 Run the opt-in GPU smoke test to exercise model loading, RNNoise conditioning, EPUB generation, quality scanning, stop/resume, M4B assembly, and final verification. It creates and removes its own small test projects:

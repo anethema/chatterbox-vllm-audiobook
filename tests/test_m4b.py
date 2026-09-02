@@ -5,6 +5,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from fractions import Fraction
 from unittest.mock import patch
 import wave
 
@@ -15,6 +16,7 @@ from chatterbox_vllm.m4b import (
     ChapterMarker,
     assemble_audiobook,
     build_ffmetadata,
+    build_audio_timeline,
     default_m4b_workers,
     delete_intermediate_chunks,
     physical_core_cpu_ids,
@@ -27,6 +29,14 @@ class M4BTests(unittest.TestCase):
     @staticmethod
     def _write_wav(path, duration_seconds=0.25, sample_rate=24000):
         frames = round(duration_seconds * sample_rate)
+        with wave.open(str(path), "wb") as audio:
+            audio.setnchannels(1)
+            audio.setsampwidth(2)
+            audio.setframerate(sample_rate)
+            audio.writeframes(b"\0\0" * frames)
+
+    @staticmethod
+    def _write_wav_frames(path, frames, sample_rate):
         with wave.open(str(path), "wb") as audio:
             audio.setnchannels(1)
             audio.setsampwidth(2)
@@ -119,6 +129,58 @@ class M4BTests(unittest.TestCase):
                 )
 
         self.assertEqual(duration, 10.1)
+
+    def test_rejects_invalid_chapter_topology(self):
+        invalid_chapters = (
+            [{"start_time": "-0.1", "end_time": "1"}],
+            [{"start_time": "0", "end_time": "1"}, {"start_time": "0.9", "end_time": "2"}],
+            [{"start_time": "0", "end_time": "5"}, {"start_time": "1", "end_time": "4"}],
+            [{"start_time": "0", "end_time": "10.01"}],
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "book.m4b"
+            output.write_bytes(b"m4b")
+            for chapters in invalid_chapters:
+                probe = subprocess.CompletedProcess(
+                    ["ffprobe"],
+                    0,
+                    json.dumps(
+                        {
+                            "streams": [{"codec_name": "aac", "duration": "10"}],
+                            "format": {"duration": "10"},
+                            "chapters": chapters,
+                        }
+                    ),
+                    "",
+                )
+                with self.subTest(chapters=chapters), patch(
+                    "chatterbox_vllm.m4b.subprocess.run", return_value=probe
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "invalid chapter timestamps"):
+                        verify_m4b(output, ffprobe="ffprobe")
+
+    def test_timeline_rounds_cumulative_sample_durations_only(self):
+        sample_rate = 44100
+        chunk_frames = 24
+        chunk_count = 200
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "book"
+            chunks_dir = project / "chunks"
+            assembly = project / ".assembly"
+            chunks_dir.mkdir(parents=True)
+            assembly.mkdir()
+            for index in range(chunk_count):
+                self._write_wav_frames(chunks_dir / f"{index:06d}.wav", chunk_frames, sample_rate)
+            chunks = [TextChunk(0, "One", "Chunk") for _ in range(chunk_count)]
+
+            _, markers, timeline_ms = build_audio_timeline(project, assembly, chunks, sample_rate)
+
+        expected_duration = (
+            chunk_count * Fraction(chunk_frames, sample_rate)
+            + (chunk_count - 1) * Fraction(round(sample_rate * 0.18), sample_rate)
+        )
+        self.assertEqual(timeline_ms, round(expected_duration * 1000))
+        self.assertEqual(markers, [ChapterMarker("One", 0, round(expected_duration * 1000))])
 
     def test_balances_segments_on_chapter_boundaries(self):
         entries = [

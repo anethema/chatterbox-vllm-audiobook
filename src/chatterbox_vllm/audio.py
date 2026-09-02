@@ -46,6 +46,13 @@ LOW_FREQUENCY_COLLAPSE_MAXIMUM_HZ = 120.0
 LOW_FREQUENCY_COLLAPSE_MINIMUM_POWER_FRACTION = 0.80
 LOW_FREQUENCY_COLLAPSE_MAXIMUM_DOMINANT_HZ = 100.0
 LOW_FREQUENCY_COLLAPSE_MINIMUM_DBFS = -35.0
+# Generated speech normally sits far above this level even before the final
+# loudness-normalization pass. This remains quieter than normal soft speech,
+# while also treating low-level residual noise as silence.
+GENERATED_AUDIO_NEAR_SILENCE_MAXIMUM_DBFS = -50.0
+# Allow conventional sentence/chapter-edge padding while rejecting the long
+# silent tails or delayed starts produced by synthesis failures.
+GENERATED_AUDIO_EDGE_SILENCE_MINIMUM_SECONDS = 3.0
 
 
 @dataclass(frozen=True)
@@ -401,17 +408,28 @@ def _expand_quality_ranges(
     return expanded
 
 
+def _is_near_silent(samples: np.ndarray) -> bool:
+    """Whether a sample range is quiet enough to be treated as silence."""
+
+    if samples.size < 1:
+        return True
+    centered = samples - np.mean(samples)
+    rms = np.sqrt(np.mean(centered * centered) + 1e-12)
+    rms_dbfs = 20.0 * np.log10(rms + 1e-12)
+    return rms_dbfs <= GENERATED_AUDIO_NEAR_SILENCE_MAXIMUM_DBFS
+
+
 def find_generated_audio_issues(
     samples,
     sample_rate: int,
     *,
     include_vad: bool = False,
 ) -> list[AudioQualityIssue]:
-    """Find known Chatterbox synthesis-collapse patterns anywhere.
+    """Find known Chatterbox silence and synthesis-collapse patterns.
 
-    Chatterbox can emit invalid speech-token runs in the middle of otherwise
-    valid speech and then recover. Analyze every complete 250 ms frame so those
-    failures are not hidden merely because the final seconds sound normal.
+    Whole-clip and edge-silence checks use the waveform's actual sample count.
+    Spectral collapse checks analyze every complete 250 ms frame so a bad
+    middle section is not hidden merely because the final seconds sound normal.
     """
 
     rate = int(sample_rate)
@@ -419,8 +437,18 @@ def find_generated_audio_issues(
         return []
     frame_size = max(1, round(rate * AUDIO_QUALITY_FRAME_SECONDS))
     flattened = np.asarray(samples, dtype=np.float32).reshape(-1)
+    if flattened.size < 1:
+        return []
     frame_count = flattened.size // frame_size
     if frame_count < 1:
+        if _is_near_silent(flattened):
+            return [
+                AudioQualityIssue(
+                    "near-silent generated audio",
+                    0.0,
+                    flattened.size / rate,
+                )
+            ]
         return []
 
     frames = flattened[:frame_count * frame_size].reshape(frame_count, frame_size)
@@ -443,6 +471,75 @@ def find_generated_audio_issues(
     )
 
     issues: list[AudioQualityIssue] = []
+
+    near_silent = rms_dbfs <= GENERATED_AUDIO_NEAR_SILENCE_MAXIMUM_DBFS
+    remainder = flattened[frame_count * frame_size :]
+    if np.all(near_silent) and _is_near_silent(remainder):
+        issues.append(
+            AudioQualityIssue(
+                "near-silent generated audio",
+                0.0,
+                flattened.size / rate,
+            )
+        )
+    else:
+        minimum_edge_samples = max(
+            1,
+            math.ceil(GENERATED_AUDIO_EDGE_SILENCE_MINIMUM_SECONDS * rate),
+        )
+        leading_end = 0
+        while leading_end < frame_count and near_silent[leading_end]:
+            leading_end += 1
+        leading_samples = leading_end * frame_size
+        if (
+            leading_samples < minimum_edge_samples
+            and flattened.size >= minimum_edge_samples
+            and _is_near_silent(flattened[:minimum_edge_samples])
+        ):
+            leading_samples = minimum_edge_samples
+        if leading_samples >= minimum_edge_samples:
+            issues.append(
+                AudioQualityIssue(
+                    "excessive leading near-silence",
+                    0.0,
+                    leading_samples / rate,
+                )
+            )
+
+        # Reframe from the end so an otherwise-valid 3-second tail is not
+        # shortened by a partial speech frame at its leading boundary.
+        trailing_frames = flattened[-frame_count * frame_size :].reshape(
+            frame_count,
+            frame_size,
+        )
+        trailing_frames = trailing_frames - np.mean(
+            trailing_frames,
+            axis=1,
+            keepdims=True,
+        )
+        trailing_rms = np.sqrt(np.mean(trailing_frames * trailing_frames, axis=1) + 1e-12)
+        trailing_near_silent = (
+            20.0 * np.log10(trailing_rms + 1e-12)
+            <= GENERATED_AUDIO_NEAR_SILENCE_MAXIMUM_DBFS
+        )
+        trailing_count = 0
+        while trailing_count < frame_count and trailing_near_silent[-trailing_count - 1]:
+            trailing_count += 1
+        trailing_samples = trailing_count * frame_size
+        if (
+            trailing_samples < minimum_edge_samples
+            and flattened.size >= minimum_edge_samples
+            and _is_near_silent(flattened[-minimum_edge_samples:])
+        ):
+            trailing_samples = minimum_edge_samples
+        if trailing_samples >= minimum_edge_samples:
+            issues.append(
+                AudioQualityIssue(
+                    "excessive trailing near-silence",
+                    (flattened.size - trailing_samples) / rate,
+                    flattened.size / rate,
+                )
+            )
 
     low_frequency_power = np.sum(
         power[:, frequencies <= LOW_FREQUENCY_COLLAPSE_MAXIMUM_HZ],
@@ -599,6 +696,8 @@ def _read_pcm16_mono(path: Path, expected_sample_rate: int) -> np.ndarray:
             "Internal-pause limiting requires nonempty mono 16-bit PCM audio "
             f"at {int(expected_sample_rate)} Hz"
         )
+    if len(content) != frames * channels * sample_width:
+        raise RuntimeError(f"Could not read normalized speech audio: {path}")
     return np.frombuffer(content, dtype="<i2").copy()
 
 

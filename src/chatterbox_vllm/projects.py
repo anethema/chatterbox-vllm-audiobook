@@ -38,7 +38,7 @@ REFERENCE_AUDIO_PREFIX = "reference-audio"
 PROJECT_PROGRESS_NAME = "progress.json"
 PROJECT_QUALITY_SCAN_NAME = "quality-scan.json"
 QUALITY_SCAN_CHECKPOINT_SCHEMA_VERSION = 1
-QUALITY_SCAN_DETECTOR_VERSION = 1
+QUALITY_SCAN_DETECTOR_VERSION = 2
 
 
 def wav_file_identity(path: str | Path) -> dict[str, int] | None:
@@ -309,12 +309,18 @@ def incomplete_project_choices(output_root: str | Path) -> list[tuple[str, str]]
 def _valid_wav(path: Path, sample_rate: int) -> bool:
     try:
         with wave.open(str(path), "rb") as audio:
-            return (
-                audio.getnchannels() == 1
-                and audio.getsampwidth() == 2
-                and audio.getframerate() == sample_rate
-                and audio.getnframes() > 0
-            )
+            channels = audio.getnchannels()
+            sample_width = audio.getsampwidth()
+            frames = audio.getnframes()
+            if (
+                channels != 1
+                or sample_width != 2
+                or audio.getframerate() != sample_rate
+                or frames <= 0
+            ):
+                return False
+            audio.setpos(frames - 1)
+            return len(audio.readframes(1)) == channels * sample_width
     except (OSError, EOFError, wave.Error):
         return False
 

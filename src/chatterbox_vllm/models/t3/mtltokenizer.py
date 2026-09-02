@@ -1,7 +1,6 @@
 import logging
 import os
-from typing import List, Optional, Union
-from pathlib import Path
+from typing import List
 import json
 from unicodedata import category, normalize
 

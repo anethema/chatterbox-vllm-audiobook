@@ -269,8 +269,13 @@ class ReferenceAudioPreparationTests(unittest.TestCase):
 class GeneratedAudioQualityTests(unittest.TestCase):
     sample_rate = 24000
 
+    def speech_like(self, seconds: float) -> np.ndarray:
+        samples = round(seconds * self.sample_rate)
+        time_axis = np.arange(samples, dtype=np.float32) / self.sample_rate
+        return 0.12 * np.sin(2 * np.pi * 180 * time_axis)
+
     def test_excluding_vad_never_calls_the_detector(self):
-        waveform = np.zeros(self.sample_rate, dtype=np.float32)
+        waveform = self.speech_like(1.0)
         with patch(
             "chatterbox_vllm.audio.default_silero_vad_detector."
             "find_loud_no_speech_ranges",
@@ -286,7 +291,7 @@ class GeneratedAudioQualityTests(unittest.TestCase):
             )
 
     def test_including_vad_maps_no_speech_ranges_to_audio_issues(self):
-        waveform = np.zeros(3 * self.sample_rate, dtype=np.float32)
+        waveform = self.speech_like(3.0)
         with patch(
             "chatterbox_vllm.audio.default_silero_vad_detector."
             "find_loud_no_speech_ranges",
@@ -315,7 +320,7 @@ class GeneratedAudioQualityTests(unittest.TestCase):
             source = Path(directory) / "chunk.wav"
             write_pcm16_mono(
                 source,
-                np.zeros(2 * self.sample_rate, dtype=np.int16),
+                (self.speech_like(2.0) * 32767).astype(np.int16),
                 self.sample_rate,
             )
             with patch(
@@ -328,6 +333,124 @@ class GeneratedAudioQualityTests(unittest.TestCase):
         detector.assert_called_once()
         self.assertEqual(issues[0].kind, "audible non-speech synthesis blob")
         self.assertEqual((issues[0].start_seconds, issues[0].end_seconds), (0.25, 1.5))
+
+    def test_detects_a_wholly_near_silent_waveform(self):
+        waveform = np.zeros(3 * self.sample_rate, dtype=np.float32)
+
+        issues = find_generated_audio_issues(waveform, self.sample_rate)
+
+        self.assertEqual(
+            issues,
+            [AudioQualityIssue("near-silent generated audio", 0.0, 3.0)],
+        )
+        self.assertEqual(
+            format_audio_quality_issues(issues),
+            "near-silent generated audio at 0.00-3.00s",
+        )
+
+    def test_detects_a_wholly_near_silent_waveform_shorter_than_a_frame(self):
+        waveform = np.zeros(round(0.1 * self.sample_rate), dtype=np.float32)
+
+        issues = find_generated_audio_issues(waveform, self.sample_rate)
+
+        self.assertEqual(
+            issues,
+            [AudioQualityIssue("near-silent generated audio", 0.0, 0.1)],
+        )
+
+    def test_detects_excessive_leading_and_trailing_near_silence(self):
+        waveform = np.concatenate(
+            [
+                np.zeros(3 * self.sample_rate, dtype=np.float32),
+                self.speech_like(2.0),
+                np.zeros(4 * self.sample_rate, dtype=np.float32),
+            ]
+        )
+
+        issues = find_generated_audio_issues(waveform, self.sample_rate)
+
+        self.assertEqual(
+            issues,
+            [
+                AudioQualityIssue("excessive leading near-silence", 0.0, 3.0),
+                AudioQualityIssue("excessive trailing near-silence", 5.0, 9.0),
+            ],
+        )
+
+    def test_detects_a_three_second_tail_after_a_non_frame_aligned_segment(self):
+        waveform = np.concatenate(
+            [self.speech_like(1.1), np.zeros(3 * self.sample_rate, dtype=np.float32)]
+        )
+
+        issues = find_generated_audio_issues(waveform, self.sample_rate)
+
+        self.assertEqual(
+            issues,
+            [AudioQualityIssue("excessive trailing near-silence", 1.1, 4.1)],
+        )
+
+    def test_detects_a_three_second_prefix_when_frames_do_not_divide_it(self):
+        sample_rate = 22049
+        speech = 0.12 * np.sin(
+            2 * np.pi * 180 * np.arange(sample_rate, dtype=np.float32) / sample_rate
+        )
+        waveform = np.concatenate(
+            [np.zeros(3 * sample_rate, dtype=np.float32), speech]
+        )
+
+        issues = find_generated_audio_issues(waveform, sample_rate)
+
+        self.assertEqual(
+            issues,
+            [AudioQualityIssue("excessive leading near-silence", 0.0, 3.0)],
+        )
+
+    def test_allows_short_leading_and_trailing_silence(self):
+        waveform = np.concatenate(
+            [
+                np.zeros(round(0.75 * self.sample_rate), dtype=np.float32),
+                self.speech_like(2.0),
+                np.zeros(round(0.75 * self.sample_rate), dtype=np.float32),
+            ]
+        )
+
+        self.assertEqual(find_generated_audio_issues(waveform, self.sample_rate), [])
+
+    def test_wav_scanner_detects_excessive_trailing_near_silence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "chunk.wav"
+            waveform = np.concatenate(
+                [self.speech_like(1.0), np.zeros(3 * self.sample_rate)]
+            )
+            write_pcm16_mono(
+                source,
+                (waveform * 32767).astype(np.int16),
+                self.sample_rate,
+            )
+            with patch(
+                "chatterbox_vllm.audio.default_silero_vad_detector."
+                "find_loud_no_speech_ranges",
+                return_value=(),
+            ):
+                issues = wav_generated_audio_issues(source, self.sample_rate)
+
+        self.assertEqual(
+            issues,
+            [AudioQualityIssue("excessive trailing near-silence", 1.0, 4.0)],
+        )
+
+    def test_wav_scanner_rejects_a_truncated_pcm_payload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "chunk.wav"
+            write_pcm16_mono(
+                source,
+                (self.speech_like(1.0) * 32767).astype(np.int16),
+                self.sample_rate,
+            )
+            source.write_bytes(source.read_bytes()[:-1])
+
+            with self.assertRaisesRegex(RuntimeError, "Could not read"):
+                wav_generated_audio_issues(source, self.sample_rate)
 
     def test_detects_a_stable_digital_tone_with_normal_audio_after_it(self):
         frame = self.sample_rate // 4

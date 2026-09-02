@@ -543,7 +543,10 @@ def _waveform_for_save(
 
     duration = tensor.shape[1] / sample_rate
     words = max(1, len(text.split()))
-    if duration < min(0.25, 0.04 * words):
+    # Keep a modest floor for short utterances, while requiring enough time for
+    # every word in longer chunks. A fixed cap lets a long response be accepted
+    # even when the model only returned its opening fragment.
+    if duration < max(0.25, 0.04 * words):
         raise GeneratedAudioValidationError(
             f"Generated audio is truncated ({duration:.2f}s for {words} words)"
         )
@@ -904,20 +907,27 @@ def _save_and_normalize_chunk(
     ffmpeg: str,
     maximum_internal_pause_seconds: float | None,
 ) -> Path:
-    ta.save(
-        str(path),
-        waveform,
-        sample_rate,
-        encoding="PCM_S",
-        bits_per_sample=16,
-    )
-    normalize_speech_wav(path, sample_rate, ffmpeg=ffmpeg)
-    if maximum_internal_pause_seconds is not None:
-        limit_internal_pauses_wav(
-            path,
+    """Atomically replace ``path`` only after all deterministic transforms pass."""
+
+    temporary = path.with_name(f".{path.stem}-{uuid4().hex}.pending{path.suffix}")
+    try:
+        ta.save(
+            str(temporary),
+            waveform,
             sample_rate,
-            maximum_seconds=maximum_internal_pause_seconds,
+            encoding="PCM_S",
+            bits_per_sample=16,
         )
+        normalize_speech_wav(temporary, sample_rate, ffmpeg=ffmpeg)
+        if maximum_internal_pause_seconds is not None:
+            limit_internal_pauses_wav(
+                temporary,
+                sample_rate,
+                maximum_seconds=maximum_internal_pause_seconds,
+            )
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
     return path
 
 
@@ -930,6 +940,8 @@ def _save_normalize_and_record_chunk(
     *,
     cacheable: bool,
 ) -> SavedChunkQuality:
+    """Persist a transformed chunk and verify the final bytes before caching."""
+
     _save_and_normalize_chunk(
         path,
         waveform,
@@ -937,7 +949,11 @@ def _save_normalize_and_record_chunk(
         ffmpeg,
         maximum_internal_pause_seconds,
     )
-    return SavedChunkQuality(path=path, verified_clean=cacheable)
+    final_issues = wav_generated_audio_issues(path, sample_rate)
+    return SavedChunkQuality(
+        path=path,
+        verified_clean=cacheable and not final_issues,
+    )
 
 
 def _limit_pauses_and_record_chunk(
@@ -946,12 +962,17 @@ def _limit_pauses_and_record_chunk(
     *,
     maximum_seconds: float,
 ) -> SavedChunkQuality:
+    """Limit pauses in an existing chunk and revalidate its final bytes."""
+
     limit_internal_pauses_wav(
         path,
         sample_rate,
         maximum_seconds=maximum_seconds,
     )
-    return SavedChunkQuality(path=path, verified_clean=True)
+    return SavedChunkQuality(
+        path=path,
+        verified_clean=not wav_generated_audio_issues(path, sample_rate),
+    )
 
 
 def _write_metadata(path: Path, book: EpubBook, source_path: str, chunks: list[TextChunk],
@@ -1007,6 +1028,51 @@ def _write_metadata(path: Path, book: EpubBook, source_path: str, chunks: list[T
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _mark_verified_project_complete(
+    metadata_path: Path,
+    project_dir: Path,
+    book: EpubBook,
+    source_path: str,
+    chunks: list[TextChunk],
+    settings: dict,
+    model_id: str,
+    output_path: str,
+) -> None:
+    """Durably mark a verified audiobook complete before cleanup begins."""
+
+    _write_metadata(
+        metadata_path,
+        book,
+        source_path,
+        chunks,
+        settings,
+        len(chunks),
+        model_id,
+        output_path,
+        chunks_available=False,
+    )
+    for description, cleanup in (
+        (
+            "progress record",
+            lambda: (project_dir / "progress.json").unlink(missing_ok=True),
+        ),
+        (
+            "quality scan checkpoint",
+            lambda: delete_quality_scan_checkpoint(project_dir),
+        ),
+        ("intermediate chunks", lambda: delete_intermediate_chunks(project_dir)),
+    ):
+        try:
+            cleanup()
+        except (OSError, RuntimeError) as error:
+            _quality_log(
+                f"[Cleanup warning] Could not remove {description}: {error}. "
+                "The verified audiobook remains complete.",
+                color="yellow",
+            )
+
 
 
 def _record_durable_results(
@@ -1093,6 +1159,8 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
                             top_p, repetition_penalty, max_chars, batch_size,
                             denoise_reference, resume_project_name,
                             progress=gr.Progress()):
+    """Coordinate durable project setup, repair, generation, and M4B assembly."""
+
     resuming = bool(resume_project_name)
     job_started, _ = job_status.try_start(project_id=resume_project_name or None)
     if not job_started:
@@ -1129,6 +1197,7 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
     persist_quality_scan_checkpoint = None
     active_project_model_id = global_model.model_id
     try:
+        # Phase 1: restore or create the immutable text plan and saved inputs.
         book = load_epub(epub_path)
         source_epub_name = Path(epub_path).name
         if resuming:
@@ -1256,6 +1325,8 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
             checkpoint_dirty_chunks = 0
             checkpoint_last_saved_at = now
 
+        # Phase 2: validate only existing WAVs not already cached by this exact
+        # detector version and file identity.
         if resuming:
             scan_indices = [
                 chunk_index
@@ -1402,6 +1473,7 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
             progress(0.975, desc="All speech chunks found; preparing M4B assembly")
         repaired_chunks = []
         retained_noisy_chunks = []
+        # Phase 3: replace damaged durable chunks before generating new ones.
         if damaged_chunks:
             job_status.update(
                 phase="repairing",
@@ -1553,8 +1625,10 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
                     _limit_pauses_and_record_chunk,
                     chunks_dir / f"{chunk_index:06d}.wav",
                     global_model.sr,
-                    maximum_seconds=maximum_internal_pause_seconds,
-                )
+                maximum_seconds=maximum_internal_pause_seconds,
+            )
+        # Phase 4: generate remaining text in GPU batches while the bounded
+        # background pool writes and validates final WAVs.
         for batch_number, start in enumerate(
             range(durable_chunks, len(chunks), batch_size)
         ):
@@ -1745,6 +1819,7 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
             len(chunks), active_project_model_id, scheduled=len(chunks),
         )
         write_project_progress(project_dir, len(chunks), len(chunks))
+        # Phase 5: assemble, verify, durably mark complete, then clean up.
         progress(0.98, desc="Preparing parallel M4B encoding")
         job_status.update(
             phase="encoding",
@@ -1801,21 +1876,19 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
             eta_seconds=None,
         )
         final_audio_seconds = verify_m4b(output_path)
-        delete_intermediate_chunks(project_dir)
-        relative_output = output_path.relative_to(Path(__file__).resolve().parent).as_posix()
-        _write_metadata(
+        relative_output = output_path.relative_to(
+            Path(__file__).resolve().parent
+        ).as_posix()
+        _mark_verified_project_complete(
             metadata_path,
+            project_dir,
             book,
             source_epub_name,
             chunks,
             settings,
-            len(chunks),
             active_project_model_id,
             relative_output,
-            chunks_available=False,
         )
-        (project_dir / "progress.json").unlink(missing_ok=True)
-        delete_quality_scan_checkpoint(project_dir)
         generation_elapsed = time.perf_counter() - generation_started
         final_speed = final_audio_seconds / max(generation_elapsed, 1e-9)
         progress(1, desc="Audiobook complete")
@@ -1837,7 +1910,8 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
             f"{len(chunks):,} speech chunks. Generated "
             f"{format_duration(final_audio_seconds)} of audio in "
             f"{format_duration(generation_elapsed)} ({final_speed:.2f}× realtime). "
-            f"Files were saved under `{project_dir}` and intermediate chunks were removed."
+            f"Files were saved under `{project_dir}`; intermediate chunks were "
+            "cleaned up when possible."
         )
     except (GenerationStopped, AssemblyStopped):
         if audio_tasks is not None:
