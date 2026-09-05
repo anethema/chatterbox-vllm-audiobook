@@ -97,10 +97,6 @@ class ConditionalCFM(BASECFM):
         t, _, dt = t_span[0], t_span[-1], t_span[1] - t_span[0]
         t = t.unsqueeze(dim=0)
 
-        # I am storing this because I can later plot it by putting a debugger here and saving it to a file
-        # Or in future might add like a return_all_steps flag
-        sol = []
-
         # Do not use concat, it may cause memory format changed and trt infer with wrong results!
         x_in = torch.zeros([2, 80, x.size(2)], device=x.device, dtype=x.dtype)
         mask_in = torch.zeros([2, 1, x.size(2)], device=x.device, dtype=x.dtype)
@@ -126,11 +122,12 @@ class ConditionalCFM(BASECFM):
             dphi_dt = ((1.0 + self.inference_cfg_rate) * dphi_dt - self.inference_cfg_rate * cfg_dphi_dt)
             x = x + dt * dphi_dt
             t = t + dt
-            sol.append(x)
             if step < len(t_span) - 1:
                 dt = t_span[step + 1] - t
 
-        return sol[-1].float()
+        # Only the last Euler state is consumed; retaining every step needlessly
+        # keeps intermediate mel tensors alive throughout waveform generation.
+        return x.float()
 
     def forward_estimator(self, x, mask, mu, t, spks, cond):
         if isinstance(self.estimator, torch.nn.Module):

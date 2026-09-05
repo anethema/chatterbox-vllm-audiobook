@@ -6,7 +6,8 @@ from typing import Optional, Union, Tuple, Any
 import time
 
 from vllm import LLM, SamplingParams
-from functools import lru_cache
+from functools import wraps
+from collections import OrderedDict
 
 import librosa
 import torch
@@ -18,7 +19,7 @@ from chatterbox_vllm.models.t3.modules.t3_config import T3Config
 from .models.s3tokenizer import S3_SR, S3_TOKEN_RATE, drop_invalid_tokens
 from .models.s3gen import S3GEN_SR, S3Gen
 from .models.voice_encoder import VoiceEncoder
-from .audio import prepared_reference_audio
+from .audio import clear_reference_cache, prepared_reference_audio
 from .models.t3 import SPEECH_TOKEN_OFFSET
 from .models.t3.modules.cond_enc import T3Cond, T3CondEnc
 from .models.t3.modules.learned_pos_emb import LearnedPositionEmbeddings
@@ -31,6 +32,17 @@ from .model_variants import (
 )
 
 REPO_ID = "ResembleAI/chatterbox"
+
+
+def _model_operation(function):
+    """Serialize complete model operations, including conditioning and S3Gen."""
+    @wraps(function)
+    def guarded(self, *args, **kwargs):
+        with self._inference_lock:
+            if getattr(self, "_closed", False):
+                raise RuntimeError("The speech model has been shut down")
+            return function(self, *args, **kwargs)
+    return guarded
 
 
 class T3WorkerExtension:
@@ -96,6 +108,13 @@ class ChatterboxTTS:
         self.variant = variant
         self.model_id = resolve_model_id(model_id)
         self._t3_generation_lock = threading.Lock()
+        self._inference_lock = threading.RLock()
+        self._conditioning_cache = OrderedDict()
+        self._closed = False
+        # Keep the conservative allocator policy. Disabling flushing preserves
+        # output in replay tests, but throughput depends on device/workload.
+        # The switch permits explicit allocator benchmarking without code edits.
+        self.flush_cuda_cache = True
 
     @property
     def sr(self) -> int:
@@ -278,12 +297,29 @@ class ChatterboxTTS:
         else:
             return { "en": "English" }
 
-    @lru_cache(maxsize=10)
+    @_model_operation
+    @torch.inference_mode()
     def get_audio_conditionals(
         self,
         wav_fpath: Optional[str] = None,
         denoise_reference: bool = False,
     ) -> Tuple[dict[str, Any], torch.Tensor]:
+        identity = None
+        if wav_fpath is not None:
+            source = Path(wav_fpath).resolve()
+            stat = source.stat()
+            identity = (str(source), stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+        key = (identity, bool(denoise_reference))
+        if key in self._conditioning_cache:
+            self._conditioning_cache.move_to_end(key)
+            return self._conditioning_cache[key]
+        result = self._compute_audio_conditionals(wav_fpath, denoise_reference)
+        self._conditioning_cache[key] = result
+        while len(self._conditioning_cache) > 10:
+            self._conditioning_cache.popitem(last=False)
+        return result
+
+    def _compute_audio_conditionals(self, wav_fpath, denoise_reference):
         if wav_fpath is None:
             s3gen_ref_dict = self.default_conds.gen
             t3_cond_prompt_tokens = self.default_conds.t3.cond_prompt_speech_tokens
@@ -322,6 +358,7 @@ class ChatterboxTTS:
 
         return s3gen_ref_dict, cond_emb
 
+    @torch.inference_mode()
     def update_exaggeration(self, cond_emb: torch.Tensor, exaggeration: float) -> torch.Tensor:
         if exaggeration == 0.5:
             return cond_emb
@@ -332,6 +369,7 @@ class ChatterboxTTS:
         ).to('cpu')
         return new_cond_emb
 
+    @_model_operation
     def generate(
         self,
         prompts: Union[str, list[str]],
@@ -369,6 +407,7 @@ class ChatterboxTTS:
             *args, **kwargs
         )
 
+    @_model_operation
     def generate_with_conds(
         self,
         prompts: Union[str, list[str]],
@@ -477,7 +516,8 @@ class ChatterboxTTS:
             print(f"[T3] Speech Token Generation time: {t3_gen_time:.2f}s")
 
             # run torch gc
-            torch.cuda.empty_cache()
+            if self.flush_cuda_cache:
+                torch.cuda.empty_cache()
 
             start_time = time.time()
             results = []
@@ -487,18 +527,23 @@ class ChatterboxTTS:
                         print(f"[S3] Processing prompt {i} of {len(batch_results)}")
 
                     # Run gc every 10 prompts
-                    if i % 10 == 0:
+                    if self.flush_cuda_cache and i % 10 == 0:
                         torch.cuda.empty_cache()
 
                     speech_tokens = torch.tensor(
                         [token - SPEECH_TOKEN_OFFSET for token in output.token_ids],
-                        device=self.target_device,
+                        dtype=torch.long,
                     )
+                    # vLLM already returns a CPU list. Clean token boundaries on
+                    # CPU before transfer instead of synchronizing GPU scalars.
                     speech_tokens = drop_invalid_tokens(speech_tokens)
-                    speech_tokens = speech_tokens[speech_tokens < 6561]
+                    speech_tokens = speech_tokens[(speech_tokens >= 0) & (speech_tokens < 6561)]
 
-                    if speech_tokens.numel() == 0:
-                        raise RuntimeError("T3 produced no valid speech tokens")
+                    if speech_tokens.numel() < 2:
+                        print(f"[T3 warning] Prompt {i}: no usable speech tokens; returning a recoverable empty waveform", flush=True)
+                        results.append(torch.empty((1, 0), dtype=torch.float32))
+                        continue
+                    speech_tokens = speech_tokens.to(self.target_device)
 
                     wav, _ = self.s3gen.inference(
                         speech_tokens=speech_tokens,
@@ -519,5 +564,23 @@ class ChatterboxTTS:
             return results
         
     def shutdown(self):
-        del self.t3
-        torch.cuda.empty_cache()
+        with self._inference_lock:
+            if self._closed:
+                return
+            self._closed = True
+            try:
+                # vLLM 0.10's V1 worker client owns subprocesses and sockets.
+                # Dropping LLM alone is insufficient when traceback frames or
+                # other references keep it alive; stop its resources explicitly.
+                engine = getattr(self.t3, "llm_engine", None)
+                backend = getattr(engine, "engine_core", None)
+                if backend is None:
+                    backend = getattr(engine, "model_executor", None)
+                if backend is not None:
+                    backend.shutdown()
+            finally:
+                self._conditioning_cache.clear()
+                for name in ("t3", "s3gen", "ve", "default_conds", "t3_cond_enc", "t3_speech_emb", "t3_speech_pos_emb"):
+                    setattr(self, name, None)
+                clear_reference_cache()
+                torch.cuda.empty_cache()

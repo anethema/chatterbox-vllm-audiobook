@@ -53,16 +53,21 @@ def wav_file_identity(path: str | Path) -> dict[str, int] | None:
     return {"size": int(status.st_size), "mtime_ns": int(status.st_mtime_ns)}
 
 
-def _parse_quality_scan_checkpoint(data: object) -> dict[int, dict[str, int]]:
+def _parse_quality_scan_checkpoint(data: object, processing_signature=None) -> dict[int, dict[str, int]]:
     """Read a strict quality-scan cache, failing safely on malformed data."""
 
     if not isinstance(data, dict):
         return {}
-    if set(data) != {
+    expected_keys = {
         "schema_version",
         "detector_version",
         "verified_clean_chunks",
-    }:
+    }
+    if processing_signature is not None:
+        expected_keys.add("processing_signature")
+        if data.get("processing_signature") != processing_signature:
+            return {}
+    if set(data) != expected_keys:
         return {}
     if data.get("schema_version") != QUALITY_SCAN_CHECKPOINT_SCHEMA_VERSION:
         return {}
@@ -96,7 +101,7 @@ def _parse_quality_scan_checkpoint(data: object) -> dict[int, dict[str, int]]:
     return verified
 
 
-def load_quality_scan_checkpoint(project_dir: str | Path) -> dict[int, dict[str, int]]:
+def load_quality_scan_checkpoint(project_dir: str | Path, *, processing_signature=None) -> dict[int, dict[str, int]]:
     """Load verified-clean chunk identities, or an empty cache if unsafe to use."""
 
     progress_path = Path(project_dir) / PROJECT_QUALITY_SCAN_NAME
@@ -104,7 +109,7 @@ def load_quality_scan_checkpoint(project_dir: str | Path) -> dict[int, dict[str,
         data = json.loads(progress_path.read_text(encoding="utf-8"))
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
         return {}
-    return _parse_quality_scan_checkpoint(data)
+    return _parse_quality_scan_checkpoint(data, processing_signature)
 
 
 def quality_scan_checkpoint_entry_matches(
@@ -121,6 +126,8 @@ def quality_scan_checkpoint_entry_matches(
 def write_quality_scan_checkpoint(
     project_dir: str | Path,
     verified_clean_chunks: dict[int, dict[str, int]],
+    *,
+    processing_signature=None,
 ) -> Path:
     """Atomically persist clean WAV identities verified by the current detector."""
 
@@ -148,6 +155,8 @@ def write_quality_scan_checkpoint(
         "detector_version": QUALITY_SCAN_DETECTOR_VERSION,
         "verified_clean_chunks": clean_entries,
     }
+    if processing_signature is not None:
+        data["processing_signature"] = processing_signature
     try:
         temporary.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
         os.replace(temporary, checkpoint_path)
@@ -160,6 +169,39 @@ def delete_quality_scan_checkpoint(project_dir: str | Path) -> None:
     """Remove resumable scan metadata after a project is fully assembled."""
 
     (Path(project_dir) / PROJECT_QUALITY_SCAN_NAME).unlink(missing_ok=True)
+
+
+def load_quality_summary(project_dir: Path, total_chunks: int) -> tuple[set[int], set[int], set[int]]:
+    """Restore whole-project repair counts without trusting malformed metadata."""
+    try:
+        data = json.loads((project_dir / "quality-summary.json").read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or data.get("version") != 1 or data.get("total_chunks") != total_chunks:
+            raise ValueError("incompatible quality summary")
+        values = []
+        for name in ("detected", "fixed", "retained"):
+            indices = data[name]
+            if not isinstance(indices, list) or any(type(i) is not int or not 0 <= i < total_chunks for i in indices):
+                raise ValueError("invalid quality indices")
+            values.append(set(indices))
+        detected, fixed, retained = values
+        if not fixed <= detected or not retained <= detected or fixed & retained:
+            raise ValueError("inconsistent quality summary")
+        return detected, fixed, retained
+    except (OSError, ValueError, KeyError, TypeError):
+        return set(), set(), set()
+
+
+def write_quality_summary(project_dir: Path, total_chunks: int, detected: set[int], fixed: set[int], retained: set[int]) -> None:
+    path = project_dir / "quality-summary.json"
+    temporary = project_dir / f".quality-summary-{uuid4().hex}.tmp"
+    try:
+        temporary.write_text(json.dumps({
+            "version": 1, "total_chunks": total_chunks,
+            "detected": sorted(detected), "fixed": sorted(fixed), "retained": sorted(retained),
+        }) + "\n", encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def project_model_id(metadata: dict) -> str:
@@ -176,7 +218,7 @@ def project_model_id(metadata: dict) -> str:
 
 def _project_directory(output_root: str | Path, project_name: str) -> Path:
     root = Path(output_root).resolve()
-    if not project_name or Path(project_name).name != project_name:
+    if not isinstance(project_name, str) or not project_name or Path(project_name).name != project_name:
         raise ResumeProjectError("Select a project directly below audiobook_outputs")
     project = (root / project_name).resolve()
     if project.parent != root:
@@ -192,14 +234,20 @@ def load_project_metadata(output_root: str | Path, project_name: str) -> tuple[P
         raise ResumeProjectError("The selected project has no resumable chunks")
     try:
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise ResumeProjectError("The selected project's metadata is unreadable") from error
+    if not isinstance(metadata, dict):
+        raise ResumeProjectError("The selected project's metadata must be an object")
+    if "settings" in metadata and not isinstance(metadata["settings"], dict):
+        raise ResumeProjectError("The selected project's settings must be an object")
     if metadata.get("output_file"):
         raise ResumeProjectError("The selected project is already complete")
     progress_path = project / PROJECT_PROGRESS_NAME
     if progress_path.is_file():
         try:
             progress = json.loads(progress_path.read_text(encoding="utf-8"))
+            if not isinstance(progress, dict):
+                raise ValueError("invalid progress record")
             for key in ("completed_chunks", "scheduled_chunks"):
                 if key in progress:
                     metadata[key] = int(progress[key])
@@ -382,6 +430,8 @@ def build_resume_plan(
         raise ResumeProjectError("The selected project is missing generation settings") from error
     if batch_size < 1:
         raise ResumeProjectError("The selected project has an invalid batch size")
+    if not isinstance(saved_chunks, list) or any(not isinstance(item, dict) for item in saved_chunks):
+        raise ResumeProjectError("The selected project has an invalid chunk plan")
 
     chunks = tuple(chunk_book(book, max_chars=max_chars))
     if total_chunks != len(chunks) or len(saved_chunks) != len(chunks):

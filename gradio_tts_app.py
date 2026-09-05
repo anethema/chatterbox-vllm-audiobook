@@ -1,5 +1,7 @@
 import argparse
 from dataclasses import dataclass
+from functools import wraps
+import inspect
 import json
 import os
 from pathlib import Path
@@ -9,6 +11,7 @@ import secrets
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import traceback
 from uuid import uuid4
@@ -63,6 +66,7 @@ from chatterbox_vllm.projects import (
     delete_quality_scan_checkpoint,
     incomplete_project_choices,
     load_quality_scan_checkpoint,
+    load_quality_summary,
     load_project_metadata,
     persist_project_inputs,
     project_model_id,
@@ -70,6 +74,7 @@ from chatterbox_vllm.projects import (
     saved_project_inputs,
     wav_file_identity,
     write_quality_scan_checkpoint,
+    write_quality_summary,
     write_project_progress,
 )
 from chatterbox_vllm.job_status import JobStatusStore, render_job_status
@@ -140,6 +145,8 @@ global_model = None
 generation_control = GenerationControl()
 job_status = JobStatusStore(OUTPUT_ROOT)
 reference_preview_directory: tempfile.TemporaryDirectory | None = None
+reference_preview_lock = threading.RLock()
+generation_task_lock = threading.Lock()
 
 
 class GenerationStopped(Exception):
@@ -181,6 +188,8 @@ class SavedChunkQuality:
 
     path: Path
     verified_clean: bool
+    issues: tuple[AudioQualityIssue, ...] = ()
+    retained_with_warning: bool = False
 
 
 def _quality_log(message: str, *, color: str | None = None) -> None:
@@ -308,10 +317,11 @@ def prepare_reference_preview(
     if not audio_prompt_path:
         return None
     global reference_preview_directory
-    if reference_preview_directory is None:
-        reference_preview_directory = tempfile.TemporaryDirectory(
-            prefix="chatterbox-reference-previews-"
-        )
+    with reference_preview_lock:
+        if reference_preview_directory is None:
+            reference_preview_directory = tempfile.TemporaryDirectory(
+                prefix="chatterbox-reference-previews-"
+            )
     destination = (
         Path(reference_preview_directory.name)
         / f"normalized-reference-{uuid4().hex}.wav"
@@ -328,6 +338,27 @@ def prepare_reference_preview(
         flush=True,
     )
     return str(destination)
+
+
+def delete_reference_preview(path: str | None) -> None:
+    """Delete only a superseded preview owned by this process/session."""
+    if not path or reference_preview_directory is None:
+        return
+    candidate = Path(path)
+    root = Path(reference_preview_directory.name).resolve()
+    if candidate.resolve().parent == root and candidate.name.startswith("normalized-reference-"):
+        candidate.unlink(missing_ok=True)
+
+
+def update_reference_preview(source, denoise, previous):
+    preview = prepare_reference_preview(source, denoise)
+    delete_reference_preview(previous)
+    return preview, preview
+
+
+def update_uploaded_reference(source, denoise, previous):
+    preview, state = update_reference_preview(source, denoise, previous)
+    return preview, source, state
 
 
 def prepare_uploaded_reference(
@@ -370,6 +401,56 @@ def generation_arguments(exaggeration, cfg_weight, temperature, diffusion_steps,
     }
 
 
+def _inference_arguments(settings: dict) -> dict:
+    """Separate inference options from project metadata, including legacy saves."""
+    defaults = generation_arguments(0.5, 0.5, 0.8, 15, 0.05, 1.0, 1.2, None)
+    return {name: settings.get(name, default) for name, default in defaults.items()}
+
+
+def _exclusive_sample(function):
+    @wraps(function)
+    def guarded(*args, **kwargs):
+        if not generation_task_lock.acquire(blocking=False):
+            raise gr.Error("Another generation job is using the model.")
+        try:
+            return function(*args, **kwargs)
+        finally:
+            generation_task_lock.release()
+    return guarded
+
+
+def _audiobook_job(function):
+    """Keep acquisition and every preflight failure inside one cleanup boundary."""
+    @wraps(function)
+    def guarded(*args, **kwargs):
+        if not generation_task_lock.acquire(blocking=False):
+            return None, "⚠️ Another generation job is using the model."
+        started = False
+        try:
+            bound = inspect.signature(function).bind(*args, **kwargs)
+            started, _ = job_status.try_start(project_id=bound.arguments.get("resume_project_name") or None)
+            if not started:
+                return None, "⚠️ Another audiobook job is already running."
+            generation_control.begin()
+            return function(*args, **kwargs)
+        except Exception as error:
+            traceback.print_exc()
+            if started:
+                job_status.finish("failed", f"Generation failed: {error}")
+            return None, f"❌ {error}"
+        finally:
+            try:
+                if started:
+                    generation_control.finish()
+                    if job_status.snapshot().active:
+                        job_status.finish("failed", "The generation job ended unexpectedly; saved files can be resumed.")
+            finally:
+                # Even a status-file I/O failure must not strand the model slot.
+                generation_task_lock.release()
+    return guarded
+
+
+@_exclusive_sample
 def generate_sample(text, audio_prompt_path, denoise_reference, exaggeration,
                     cfg_weight, temperature, seed_num, diffusion_steps, min_p, top_p,
                     repetition_penalty):
@@ -568,6 +649,8 @@ def _retry_generation_args(
     settings: dict,
     used_seeds: set[int] | None = None,
 ) -> dict:
+    if generation_control.stop_requested():
+        raise GenerationStopped
     retry_args = dict(settings)
     previous_seed = retry_args.get("seed")
     used_seeds = used_seeds if used_seeds is not None else set()
@@ -953,6 +1036,8 @@ def _save_normalize_and_record_chunk(
     return SavedChunkQuality(
         path=path,
         verified_clean=cacheable and not final_issues,
+        issues=tuple(final_issues),
+        retained_with_warning=not cacheable,
     )
 
 
@@ -969,10 +1054,44 @@ def _limit_pauses_and_record_chunk(
         sample_rate,
         maximum_seconds=maximum_seconds,
     )
-    return SavedChunkQuality(
-        path=path,
-        verified_clean=not wav_generated_audio_issues(path, sample_rate),
-    )
+    issues = tuple(wav_generated_audio_issues(path, sample_rate))
+    return SavedChunkQuality(path=path, verified_clean=not issues, issues=issues)
+
+
+def _repair_saved_chunk(
+    path: Path,
+    text: str,
+    sample_rate: int,
+    ffmpeg: str,
+    maximum_pause: float | None,
+    generate,
+) -> SavedChunkQuality:
+    """Apply bounded recovery to what the listener hears, after normalization.
+
+    Candidates stay temporary until recovery chooses an output. Model/IO errors
+    propagate; only invalid waveforms are delegated to the existing retry policy.
+    """
+    initial, _ = ta.load(str(path))
+    with tempfile.TemporaryDirectory(prefix="chatterbox-final-repair-") as directory:
+        candidate = Path(directory) / "candidate.wav"
+
+        def normalized_candidate(part):
+            raw = generate(part)
+            try:
+                waveform = _waveform_for_save(raw, part, sample_rate, allow_quality_issues=True)
+            except GeneratedAudioValidationError:
+                return raw
+            _save_and_normalize_chunk(candidate, waveform, sample_rate, ffmpeg, maximum_pause)
+            return ta.load(str(candidate))[0]
+
+        recovered = _recover_generated_waveform(
+            initial, text, sample_rate, f"final WAV {path.stem}",
+            lambda: normalized_candidate(text), normalized_candidate,
+        )
+        return _save_normalize_and_record_chunk(
+            path, recovered.waveform, sample_rate, ffmpeg, maximum_pause,
+            cacheable=not recovered.retained_with_warning,
+        )
 
 
 def _write_metadata(path: Path, book: EpubBook, source_path: str, chunks: list[TextChunk],
@@ -1080,6 +1199,7 @@ def _record_durable_results(
     durable_indices: set[int],
     durable_chunks: int,
     verified_clean_chunks: dict[int, dict[str, int]],
+    on_result=None,
 ) -> tuple[int, int]:
     """Record completed background output and cache only verified final WAVs."""
 
@@ -1089,6 +1209,8 @@ def _record_durable_results(
         if not isinstance(result, SavedChunkQuality):
             raise RuntimeError("Background audio task returned an unexpected result")
         path = result.path
+        if on_result is not None:
+            on_result(result)
         chunk_index = int(path.stem)
         durable_indices.add(int(Path(path).stem))
         identity = wav_file_identity(path)
@@ -1154,6 +1276,7 @@ def resume_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weight
     )
 
 
+@_audiobook_job
 def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weight,
                             temperature, seed_num, diffusion_steps, min_p,
                             top_p, repetition_penalty, max_chars, batch_size,
@@ -1162,18 +1285,13 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
     """Coordinate durable project setup, repair, generation, and M4B assembly."""
 
     resuming = bool(resume_project_name)
-    job_started, _ = job_status.try_start(project_id=resume_project_name or None)
-    if not job_started:
-        return None, "⚠️ Another audiobook job is already running."
-    generation_control.begin()
     if resuming:
         try:
             resume_dir, _ = load_project_metadata(OUTPUT_ROOT, resume_project_name)
             saved_epub, saved_reference = saved_project_inputs(resume_dir)
-            epub_path = epub_path or (str(saved_epub) if saved_epub else None)
+            epub_path = str(saved_epub) if saved_epub else epub_path
             audio_prompt_path = (
-                audio_prompt_path
-                or (str(saved_reference) if saved_reference else None)
+                str(saved_reference) if saved_reference else audio_prompt_path
             )
         except ResumeProjectError as error:
             job_status.finish("failed", f"Could not resume selected project: {error}")
@@ -1208,6 +1326,7 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
             project_dir = resume_plan.project_dir
             chunks = list(resume_plan.chunks)
             settings = dict(resume_plan.metadata["settings"])
+            settings.setdefault("denoise_reference", False)
             denoise_reference = bool(settings.get("denoise_reference", False))
             active_project_model_id = project_model_id(resume_plan.metadata)
             source_epub_name = resume_plan.metadata.get(
@@ -1292,10 +1411,24 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
             "maximum_internal_pause_seconds"
         )
         damaged_chunks = {}
-        quality_detected_chunks: set[int] = set()
-        quality_fixed_chunks: set[int] = set()
-        quality_retained_chunks: set[int] = set()
-        verified_clean_chunks = load_quality_scan_checkpoint(project_dir)
+        (
+            quality_detected_chunks,
+            quality_fixed_chunks,
+            quality_retained_chunks,
+        ) = load_quality_summary(project_dir, len(chunks))
+        processing_signature = {
+            "version": 1, "sample_rate": global_model.sr,
+            "maximum_internal_pause_seconds": maximum_internal_pause_seconds,
+            "loudness_target_lufs": TARGET_LUFS,
+            "true_peak_dbtp": TRUE_PEAK_DBTP, "loudness_range_lu": LOUDNESS_RANGE_LU,
+        }
+        verified_clean_chunks = load_quality_scan_checkpoint(
+            project_dir, processing_signature=processing_signature,
+        )
+        final_quality_pending = {}
+        finalized_indices = set()
+        unreported_batches = []
+        s3gen_ref = cond_emb = None
         stale_checkpoint_indices = [
             chunk_index
             for chunk_index in verified_clean_chunks
@@ -1321,9 +1454,62 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
                 < QUALITY_SCAN_CHECKPOINT_UPDATE_SECONDS
             ):
                 return
-            write_quality_scan_checkpoint(project_dir, verified_clean_chunks)
+            write_quality_scan_checkpoint(
+                project_dir, verified_clean_chunks,
+                processing_signature=processing_signature,
+            )
+            write_quality_summary(
+                project_dir, len(chunks), quality_detected_chunks,
+                quality_fixed_chunks, quality_retained_chunks,
+            )
             checkpoint_dirty_chunks = 0
             checkpoint_last_saved_at = now
+
+        def record_saved_result(result, *, retry_allowed=True):
+            nonlocal checkpoint_dirty_chunks
+            index = int(result.path.stem)
+            finalized_indices.add(index)
+            if result.issues or result.retained_with_warning:
+                quality_detected_chunks.add(index)
+                quality_fixed_chunks.discard(index)
+                quality_retained_chunks.add(index)
+                detail = (
+                    format_audio_quality_issues(list(result.issues))
+                    or "bounded recovery retained a fallback"
+                )
+                if result.issues and retry_allowed and not result.retained_with_warning:
+                    final_quality_pending[index] = result.issues
+                    _quality_log(
+                        f"[Audio quality scan] Final WAV {index:06d}: "
+                        f"{detail}; queued for bounded repair", color="red",
+                    )
+                else:
+                    _quality_log(
+                        f"[Audio quality warning] Final WAV {index:06d}: "
+                        f"{detail}; retained after bounded recovery", color="red",
+                    )
+            elif index in quality_detected_chunks:
+                quality_fixed_chunks.add(index)
+                quality_retained_chunks.discard(index)
+            checkpoint_dirty_chunks += 1
+
+        def report_ready_batches():
+            for start, count in list(unreported_batches):
+                indices = set(range(start, start + count))
+                if indices <= finalized_indices and not indices.intersection(final_quality_pending):
+                    _log_batch_quality_summary(start, count, sorted(indices & quality_retained_chunks))
+                    unreported_batches.remove((start, count))
+                    finalized_indices.difference_update(indices)
+
+        def collect_saved_results():
+            nonlocal durable_chunks, checkpoint_dirty_chunks
+            durable_chunks, changes = _record_durable_results(
+                audio_tasks, durable_indices, durable_chunks, verified_clean_chunks,
+                on_result=record_saved_result,
+            )
+            checkpoint_dirty_chunks += changes
+            persist_quality_scan_checkpoint()
+            report_ready_batches()
 
         # Phase 2: validate only existing WAVs not already cached by this exact
         # detector version and file identity.
@@ -1361,6 +1547,13 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
                 if generation_control.stop_requested():
                     raise GenerationStopped
                 chunk_path = chunks_dir / f"{chunk_index:06d}.wav"
+                # The checkpoint certifies final transformed bytes. Apply any
+                # missing/changed pause policy once before this single scan.
+                if maximum_internal_pause_seconds is not None:
+                    limit_internal_pauses_wav(
+                        chunk_path, global_model.sr,
+                        maximum_seconds=maximum_internal_pause_seconds,
+                    )
                 issues = wav_generated_audio_issues(chunk_path, global_model.sr)
                 if issues:
                     damaged_chunks[chunk_index] = issues
@@ -1372,6 +1565,9 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
                     if identity is not None and verified_clean_chunks.get(chunk_index) != identity:
                         verified_clean_chunks[chunk_index] = identity
                         checkpoint_dirty_chunks += 1
+                    if chunk_index in quality_detected_chunks:
+                        quality_fixed_chunks.add(chunk_index)
+                        quality_retained_chunks.discard(chunk_index)
                 persist_quality_scan_checkpoint()
                 now = time.perf_counter()
                 should_update_progress = (
@@ -1439,9 +1635,7 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
         completed_characters = 0
         generated_audio_seconds = 0.0
         generation_started = time.perf_counter()
-        if remaining_chunks or damaged_chunks or (
-            durable_chunks and maximum_internal_pause_seconds is not None
-        ):
+        if remaining_chunks or damaged_chunks:
             audio_tasks = BackgroundTaskPool(
                 max_workers=AUDIO_WORKERS,
                 max_pending=MAX_PENDING_AUDIO_TASKS,
@@ -1488,18 +1682,8 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
             if generation_control.stop_requested():
                 raise GenerationStopped
             chunk = chunks[chunk_index]
-            repair_args = dict(settings)
+            repair_args = _inference_arguments(settings)
             retry_seeds: set[int] = set()
-            for metadata_key in (
-                "max_chars",
-                "batch_size",
-                "loudness_target_lufs",
-                "true_peak_dbtp",
-                "loudness_range_lu",
-                "maximum_internal_pause_seconds",
-                "denoise_reference",
-            ):
-                repair_args.pop(metadata_key)
             repaired = global_model.generate_with_conds(
                 [chunk.text],
                 s3gen_ref=s3gen_ref,
@@ -1538,6 +1722,9 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
             )
             repaired_path = chunks_dir / f"{chunk_index:06d}.wav"
             saved_issues = wav_generated_audio_issues(repaired_path, global_model.sr)
+            checkpoint_dirty_chunks += 1
+            if saved_issues and not recovery.retained_with_warning:
+                final_quality_pending[chunk_index] = tuple(saved_issues)
             if saved_issues or recovery.retained_with_warning:
                 if chunk_index in verified_clean_chunks:
                     verified_clean_chunks.pop(chunk_index)
@@ -1606,27 +1793,6 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
                     else None
                 ),
             )
-        if durable_chunks and maximum_internal_pause_seconds is not None:
-            job_status.update(
-                phase="pause_processing",
-                message="Applying internal pause limit to existing audio…",
-                completed_chunks=0,
-                total_chunks=durable_chunks,
-                fraction=0.0,
-                realtime_speed=None,
-                eta_seconds=None,
-            )
-            for chunk_index in range(durable_chunks):
-                if generation_control.stop_requested():
-                    raise GenerationStopped
-                if chunk_index in damaged_chunks:
-                    continue
-                audio_tasks.submit(
-                    _limit_pauses_and_record_chunk,
-                    chunks_dir / f"{chunk_index:06d}.wav",
-                    global_model.sr,
-                maximum_seconds=maximum_internal_pause_seconds,
-            )
         # Phase 4: generate remaining text in GPU batches while the bounded
         # background pool writes and validates final WAVs.
         for batch_number, start in enumerate(
@@ -1656,17 +1822,7 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
                         f"of {len(chunks)}"
                     ),
                 )
-            batch_args = dict(settings)
-            for metadata_key in (
-                "max_chars",
-                "batch_size",
-                "loudness_target_lufs",
-                "true_peak_dbtp",
-                "loudness_range_lu",
-                "maximum_internal_pause_seconds",
-                "denoise_reference",
-            ):
-                batch_args.pop(metadata_key)
+            batch_args = _inference_arguments(settings)
             if seed is not None:
                 batch_args["seed"] = seed + start
             audios = global_model.generate_with_conds(
@@ -1675,18 +1831,9 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
                 cond_emb=cond_emb,
                 **batch_args,
             )
-            durable_chunks, checkpoint_change_count = _record_durable_results(
-                audio_tasks,
-                durable_indices,
-                durable_chunks,
-                verified_clean_chunks,
-            )
-            if checkpoint_change_count:
-                checkpoint_dirty_chunks += checkpoint_change_count
-                persist_quality_scan_checkpoint()
+            collect_saved_results()
             if len(audios) != len(batch):
                 raise RuntimeError(f"Model returned {len(audios)} outputs for a batch of {len(batch)}")
-            retained_quality_chunks = []
             for offset, (chunk, audio) in enumerate(zip(batch, audios)):
                 chunk_index = start + offset
                 retry_seeds: set[int] = set()
@@ -1717,13 +1864,14 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
                 if initial_quality_issues:
                     quality_detected_chunks.add(chunk_index)
                 if recovery.retained_with_warning:
-                    retained_quality_chunks.append(chunk_index)
                     quality_detected_chunks.add(chunk_index)
                     quality_retained_chunks.add(chunk_index)
                     quality_fixed_chunks.discard(chunk_index)
                 elif initial_quality_issues:
                     quality_fixed_chunks.add(chunk_index)
                     quality_retained_chunks.discard(chunk_index)
+                if initial_quality_issues or recovery.retained_with_warning:
+                    checkpoint_dirty_chunks += 1
                 generated_audio_seconds += waveform.shape[1] / global_model.sr
                 completed_characters += len(chunk.text)
                 chunk_path = chunks_dir / f"{chunk_index:06d}.wav"
@@ -1736,21 +1884,9 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
                     maximum_internal_pause_seconds,
                     cacheable=not recovery.retained_with_warning,
                 )
-            _log_batch_quality_summary(
-                start,
-                len(batch),
-                retained_quality_chunks,
-            )
+            unreported_batches.append((start, len(batch)))
             completed_chunks = start + len(batch)
-            durable_chunks, checkpoint_change_count = _record_durable_results(
-                audio_tasks,
-                durable_indices,
-                durable_chunks,
-                verified_clean_chunks,
-            )
-            if checkpoint_change_count:
-                checkpoint_dirty_chunks += checkpoint_change_count
-                persist_quality_scan_checkpoint()
+            collect_saved_results()
             write_project_progress(project_dir, durable_chunks, completed_chunks)
             elapsed = time.perf_counter() - generation_started
             estimate = estimate_progress(
@@ -1791,14 +1927,7 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
                 eta_seconds=None,
             )
             audio_tasks.finish()
-            durable_chunks, checkpoint_change_count = _record_durable_results(
-                audio_tasks,
-                durable_indices,
-                durable_chunks,
-                verified_clean_chunks,
-            )
-            if checkpoint_change_count:
-                checkpoint_dirty_chunks += checkpoint_change_count
+            collect_saved_results()
             audio_tasks = None
             job_status.update(
                 phase="pause_processing",
@@ -1807,6 +1936,42 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
                 total_chunks=durable_chunks,
                 fraction=0.975,
             )
+        # Final-only detections (for example after gain changes) get the same
+        # finite retry/split policy. A second failed final scan is retained and
+        # reported, never requeued indefinitely.
+        for index in sorted(final_quality_pending):
+            if generation_control.stop_requested():
+                raise GenerationStopped
+            job_status.update(phase="repairing", message=f"Repairing final WAV {index:06d}…")
+            if s3gen_ref is None:
+                s3gen_ref, cond_emb = global_model.get_audio_conditionals(
+                    audio_prompt_path, denoise_reference=bool(denoise_reference),
+                )
+            used_seeds = set()
+
+            def generate_final_candidate(text):
+                if generation_control.stop_requested():
+                    raise GenerationStopped
+                return global_model.generate_with_conds(
+                    [text], s3gen_ref=s3gen_ref, cond_emb=cond_emb,
+                    **_retry_generation_args(_inference_arguments(settings), used_seeds),
+                )[0]
+
+            result = _repair_saved_chunk(
+                chunks_dir / f"{index:06d}.wav", chunks[index].text,
+                global_model.sr, ffmpeg, maximum_internal_pause_seconds, generate_final_candidate,
+            )
+            record_saved_result(result, retry_allowed=False)
+            if result.verified_clean:
+                identity = wav_file_identity(result.path)
+                if identity is not None:
+                    verified_clean_chunks[index] = identity
+                _quality_log(f"[Audio quality repair] Final WAV {index:06d}: fixed and verified", color="green")
+            else:
+                verified_clean_chunks.pop(index, None)
+            final_quality_pending.pop(index)
+            persist_quality_scan_checkpoint()
+            report_ready_batches()
         persist_quality_scan_checkpoint(force=True)
         _log_project_quality_summary(
             len(chunks),
@@ -1980,7 +2145,7 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
         generation_control.finish()
 
 
-with gr.Blocks(title="Chatterbox vLLM Audiobook", css=JOB_MONITOR_CSS) as demo:
+with gr.Blocks(title="Chatterbox vLLM Audiobook", css=JOB_MONITOR_CSS, delete_cache=(3600, 86400)) as demo:
     gr.Markdown(
         "# Chatterbox vLLM\n"
         "Quick voice tests and batched EPUB audiobook generation.  \n"
@@ -1991,10 +2156,11 @@ with gr.Blocks(title="Chatterbox vLLM Audiobook", css=JOB_MONITOR_CSS) as demo:
         with gr.Column(scale=1):
             gr.Markdown("### Voice and generation settings")
             reference_source = gr.State(None)
+            reference_preview_state = gr.State(None, delete_callback=delete_reference_preview)
             ref_wav = gr.Audio(
                 sources=["upload", "microphone"],
                 type="filepath",
-                label="Reference Audio (the processed conditioning audio)",
+                label="Reference Audio (processed conditioning audio; up to 5 minutes / 64 MiB)",
                 value=None,
             )
             denoise_reference = gr.Checkbox(
@@ -2106,14 +2272,16 @@ with gr.Blocks(title="Chatterbox vLLM Audiobook", css=JOB_MONITOR_CSS) as demo:
     )
 
     ref_wav.input(
-        fn=prepare_uploaded_reference,
-        inputs=[ref_wav, denoise_reference],
-        outputs=[ref_wav, reference_source],
+        fn=update_uploaded_reference,
+        inputs=[ref_wav, denoise_reference, reference_preview_state],
+        outputs=[ref_wav, reference_source, reference_preview_state],
+        concurrency_id="reference-preparation",
     )
     denoise_reference.input(
-        fn=prepare_reference_preview,
-        inputs=[reference_source, denoise_reference],
-        outputs=ref_wav,
+        fn=update_reference_preview,
+        inputs=[reference_source, denoise_reference, reference_preview_state],
+        outputs=[ref_wav, reference_preview_state],
+        concurrency_id="reference-preparation",
     )
     run_btn.click(
         fn=generate_sample,
@@ -2123,6 +2291,7 @@ with gr.Blocks(title="Chatterbox vLLM Audiobook", css=JOB_MONITOR_CSS) as demo:
             diffusion_steps, min_p, top_p, repetition_penalty,
         ],
         outputs=audio_output,
+        concurrency_id="model-generation",
     )
     epub_file.change(
         fn=inspect_epub_file,
@@ -2145,6 +2314,7 @@ with gr.Blocks(title="Chatterbox vLLM Audiobook", css=JOB_MONITOR_CSS) as demo:
         # visible Markdown component a live output causes Gradio to render the
         # same queue/progress message both there and in its normal progress UI.
         outputs=[epub_audio_output, epub_result_status],
+        concurrency_id="model-generation",
     )
     resume_generation_event = resume_epub_btn.click(
         fn=resume_epub_audiobook,
@@ -2154,6 +2324,7 @@ with gr.Blocks(title="Chatterbox vLLM Audiobook", css=JOB_MONITOR_CSS) as demo:
             batch_size, denoise_reference, resume_project,
         ],
         outputs=[epub_audio_output, epub_result_status],
+        concurrency_id="model-generation",
     )
     resume_generation_event.then(
         fn=lambda status: status,
@@ -2173,9 +2344,10 @@ with gr.Blocks(title="Chatterbox vLLM Audiobook", css=JOB_MONITOR_CSS) as demo:
         queue=False,
     )
     resume_project_event.then(
-        fn=prepare_reference_preview,
-        inputs=[reference_source, denoise_reference],
-        outputs=ref_wav,
+        fn=update_reference_preview,
+        inputs=[reference_source, denoise_reference, reference_preview_state],
+        outputs=[ref_wav, reference_preview_state],
+        concurrency_id="reference-preparation",
     )
     epub_generation_event.then(
         fn=lambda status: status,
@@ -2215,4 +2387,5 @@ if __name__ == "__main__":
         server_port=7860,
         share=command_line.share,
         show_api=False,
+        max_file_size="128mb",
     )

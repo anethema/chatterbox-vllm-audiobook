@@ -11,6 +11,7 @@ import numpy as np
 
 from chatterbox_vllm.audio import (
     AudioQualityIssue,
+    clear_reference_cache,
     find_generated_audio_issues,
     format_audio_quality_issues,
     limit_internal_pauses_wav,
@@ -128,6 +129,7 @@ class ReferenceAudioNormalizationTests(unittest.TestCase):
                     side_effect=successful_run,
                 ),
                 patch("builtins.print") as printed,
+                patch("chatterbox_vllm.audio._check_reference_duration"),
             ):
                 with normalized_reference_audio(
                     source,
@@ -153,6 +155,12 @@ class ReferenceAudioNormalizationTests(unittest.TestCase):
 
 
 class ReferenceAudioPreparationTests(unittest.TestCase):
+    def setUp(self):
+        clear_reference_cache()
+
+    def tearDown(self):
+        clear_reference_cache()
+
     def test_enabled_denoising_precedes_normalization_and_preserves_source(self):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "quiet.mp3"
@@ -184,7 +192,7 @@ class ReferenceAudioPreparationTests(unittest.TestCase):
                 ),
             ):
                 with prepared_reference_audio(source, 24000, denoise=True) as result:
-                    self.assertEqual(result, normalized)
+                    self.assertEqual(result.read_bytes(), normalized.read_bytes())
 
             self.assertEqual(
                 events,
@@ -225,7 +233,7 @@ class ReferenceAudioPreparationTests(unittest.TestCase):
                 ),
             ):
                 with prepared_reference_audio(source, 24000, denoise=False) as result:
-                    self.assertEqual(result, normalized)
+                    self.assertEqual(result.read_bytes(), normalized.read_bytes())
 
             self.assertEqual(source.read_bytes(), b"original")
 
@@ -260,7 +268,7 @@ class ReferenceAudioPreparationTests(unittest.TestCase):
                 ),
             ):
                 with prepared_reference_audio(source, 24000, denoise=True) as result:
-                    self.assertEqual(result, normalized)
+                    self.assertEqual(result.read_bytes(), normalized.read_bytes())
 
             self.assertEqual(source.read_bytes(), b"original")
             self.assertTrue(any("Reference denoise" in message for message in printed))

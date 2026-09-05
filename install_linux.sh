@@ -83,6 +83,13 @@ for package, expected in expected_audio_packages.items():
             f"Expected {package} {expected} from uv.lock, but found {installed}"
         )
 
+from packaging.version import Version
+
+if not Version("0.49.1") <= Version(version("starlette")) < Version("0.50"):
+    raise SystemExit("Starlette must include the file-response security fix (>=0.49.1,<0.50)")
+if not Version("0.120.2") <= Version(version("fastapi")) < Version("0.121"):
+    raise SystemExit("FastAPI must match the tested patched web stack (>=0.120.2,<0.121)")
+
 silero_model = load_silero_vad()
 silero_model.reset_states()
 
@@ -97,6 +104,7 @@ print(f"PyTorch {torch.__version__}")
 print(f"PyTorch CUDA runtime {torch.version.cuda}")
 print(f"vLLM {vllm.__version__}")
 print(f"Silero VAD {version('silero-vad')}")
+print(f"Web stack: FastAPI {version('fastapi')}, Starlette {version('starlette')}")
 print(
     "Reference denoise stack "
     + ", ".join(

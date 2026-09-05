@@ -83,7 +83,7 @@ The installer:
 4. Creates <code>.venv</code> with Python 3.12.
 5. Installs the exact dependencies in <code>uv.lock</code>.
 6. Runs a real RNNoise-then-normalization smoke test on the bundled reference clip.
-7. Verifies CUDA through PyTorch and prints the PyTorch, CUDA runtime, vLLM, Silero VAD, RNNoise stack, GPU, FFmpeg, and FFprobe versions.
+7. Verifies CUDA through PyTorch, checks the security-patched FastAPI/Starlette pair, and prints the model, web, audio, GPU, FFmpeg, and FFprobe versions.
 
 It does not install or modify the NVIDIA driver.
 
@@ -124,7 +124,7 @@ The final editable install adds this project without asking pip to resolve the d
 Verify the environment:
 
 ~~~bash
-.venv/bin/python -c 'from importlib.metadata import version; import torch, vllm; print(torch.__version__, torch.version.cuda, vllm.__version__); print(version("silero-vad"), version("pyrnnoise"), version("audiolab"), version("av")); print(torch.cuda.get_device_name(0)); assert torch.cuda.is_available()'
+.venv/bin/python -c 'from importlib.metadata import version; import torch, vllm; print(torch.__version__, torch.version.cuda, vllm.__version__); print({p: version(p) for p in ("silero-vad", "pyrnnoise", "audiolab", "av", "fastapi", "starlette")}); print(torch.cuda.get_device_name(0)); assert torch.cuda.is_available()'
 ffmpeg -version
 ffprobe -version
 ~~~
@@ -192,15 +192,21 @@ Current UI defaults:
 
 Larger batches can improve GPU throughput but increase peak resource use. Diffusion steps primarily trade speed for waveform quality. Lower CFG/Pace values loosen text guidance and often produce slower delivery, while higher exaggeration increases expressiveness and can also increase pace. Extreme sampling or exaggeration settings can reduce stability. New projects save CFG/Pace with their other generation settings so resumed chunks keep the same delivery. V3 pause limiting runs with WAV saving and normalization in the bounded CPU background pool, allowing GPU generation to continue with the next batch.
 
-Opening another browser tab does not load another model copy; every tab uses the same server process and model. Do not start overlapping text and EPUB jobs, because separate Gradio events can contend for the same GPU, CPU, and RAM and may make a long conversion appear stalled.
+Opening another browser tab does not load another model copy; every tab uses the same server process and model. Text samples, new books, and resumed books share one generation queue. An additional server-side guard prevents overlapping generation even when functions are invoked outside Gradio's queue.
 
 Uploaded voice references are processed from a temporary copy; the original upload is never changed. With reference denoising disabled, the app applies two-pass normalization to -20 LUFS with a -3 dBTP ceiling. With it enabled, RNNoise first suppresses steady background noise and the denoised result is then normalized. The checkbox can be changed before or after loading a sample, and the Gradio player immediately updates to the same processing used by both the Text Sample and EPUB paths. The choice is saved with new audiobook projects and restored on resume. If RNNoise unexpectedly fails, the terminal prints a visible warning and generation safely falls back to the normalized original.
 
 Reference denoising is intentionally optional. It can help a quiet recording whose normalization would otherwise magnify hiss or hum, but an already clean sample may sound more natural with it disabled. Listen to the processed reference in the player before starting a long book.
 
+Voice references must be ordinary audio files, no larger than 64 MiB or five minutes. WAV, MP3, FLAC, Ogg, M4A, WebM, AAC, AIFF, and AU containers are supported; playlists and formats that redirect FFmpeg to other files are rejected. Reference-processing subprocesses have a two-minute timeout, and uploads have a 128 MB per-file ceiling (including EPUBs). These limits reduce accidental resource exhaustion; they do not make an unauthenticated public link safe for untrusted users.
+
+Prepared references are cached by content and denoise setting, so preview and generation can reuse the same normalized bytes even after the source is copied into a project. This process-local cache is limited to 16 entries and 128 MiB. Replacing a file invalidates its conditioning cache. Superseded player previews are removed, and Gradio's temporary cache is periodically expired; saved project inputs and completed audiobooks are retained.
+
 Immediately before inference, the app conservatively removes unsupported quotation marks and decorative symbols, strips attached numeric citations, and spaces uppercase dotted initials such as <code>J.R.R.</code>. Ordinary punctuation, decimal numbers, abbreviations such as <code>p.m.</code>, and multilingual letters are retained. This cleanup affects only the text sent to the model; original EPUB text remains in project metadata.
 
 Every generated waveform is scanned before it is accepted. The scanner combines deterministic spectral and silence checks with CPU-based Silero VAD to find audible non-speech blobs that may evade a simple tone detector. Wholly near-silent audio and at least three seconds of continuous leading or trailing near-silence are rejected, while ordinary short edge padding is preserved. A failed chunk is regenerated once with a fresh random seed, then split into progressively smaller text if necessary. A repeatedly failing single sentence is retained with a red warning so an unattended project continues instead of stopping indefinitely. The terminal prints one green or red result for each batch and a colored detected/fixed/retained summary when the project finishes.
+
+The saved WAV is scanned again after normalization and pause limiting. A new finding at this stage gets bounded recovery using normalized candidates, not merely a warning hidden in the resume cache. Batch success is reported only after final-file results are known. Any unresolved output is explicitly counted as retained with warnings, and detected/fixed/retained chunk indices persist across restarts in <code>quality-summary.json</code>. These checks catch known failure patterns, not every possible audible defect.
 
 ## Output files
 
@@ -214,6 +220,7 @@ audiobook_outputs/Book-YYYYMMDD-HHMMSS-ID/
 ├── metadata.json
 ├── progress.json          # incomplete projects only
 ├── quality-scan.json      # verified resume-scan cache for incomplete projects
+├── quality-summary.json   # detected/fixed/retained indices, kept after completion
 ├── chunks/                # incomplete projects only
 └── audiobook.m4b          # completed projects
 ~~~
@@ -236,9 +243,11 @@ To resume:
 4. Select the project; its saved EPUB and reference audio load automatically.
 5. Click **Resume Selected / Monitored Project**. On a newly connected browser, the monitored stopped or interrupted project is used automatically when no dropdown choice is selected.
 
-Resume validates the saved EPUB's chunk plan and deeply scans WAV files that have not already passed the current detector. Verified files are cached by size and modification time; changed, missing, stale, or malformed cache entries are scanned again. Resume restarts at a safe batch boundary if the final batch was interrupted. When every WAV is already valid, it skips speech generation and goes directly to M4B assembly.
+Resume validates the saved EPUB's chunk plan and deeply scans WAV files that have not already passed the current detector. Verified files are cached by size, modification time, and processing settings; changed, missing, stale, or malformed cache entries are scanned again. Matching final-file cache entries skip both rescanning and redundant pause processing. Older caches without a processing signature require one full scan after this update. Resume restarts at a safe batch boundary if the final batch was interrupted. When every WAV is already valid, it skips speech generation and goes directly to M4B assembly.
 
 Projects created before saved inputs were implemented may request the original EPUB and reference audio once. A project with unfinished speech must use its recorded model version so one audiobook cannot silently mix voices from different models.
+
+Resume always prefers the project's saved EPUB and voice over whatever is currently selected in the browser. Start a new project to deliberately change the voice or generation settings.
 
 ## Model selection
 
@@ -282,6 +291,8 @@ git pull --ff-only origin master
 ~~~
 
 Rerunning the installer is safe and synchronizes <code>.venv</code> to the updated lockfile. Model files already present in the Hugging Face cache are reused.
+
+The tested web stack is FastAPI 0.120.4 with Starlette 0.49.3, including the Starlette file-download Range-header fix (CVE-2025-62727). Update through the installer or the generated requirements file rather than upgrading Starlette alone. PyTorch, vLLM, Gradio, and the model checkpoints remain pinned to the existing tested versions.
 
 The committed <code>requirements.txt</code> is a generated pip compatibility file. When dependencies change, regenerate it from the validated lockfile instead of editing it manually:
 

@@ -1,6 +1,7 @@
 from contextlib import contextmanager
 from dataclasses import dataclass
 import json
+import hashlib
 import math
 import os
 from pathlib import Path
@@ -8,6 +9,8 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
+from collections import OrderedDict
 import time
 from typing import Iterator, Mapping
 from uuid import uuid4
@@ -23,6 +26,15 @@ TRUE_PEAK_DBTP = -2.0
 REFERENCE_TARGET_LUFS = -20.0
 REFERENCE_TRUE_PEAK_DBTP = -3.0
 REFERENCE_DENOISE_SAMPLE_RATE = 48_000
+MAX_REFERENCE_BYTES = 64 * 1024 * 1024
+MAX_REFERENCE_SECONDS = 300
+REFERENCE_PROCESS_TIMEOUT = 120
+# Do not permit playlists/concat or other formats that can open secondary files.
+REFERENCE_FORMATS = "wav,mp3,flac,ogg,mov,matroska,webm,aac,aiff,au"
+REFERENCE_CACHE_BYTES = 128 * 1024 * 1024
+_reference_cache_lock = threading.RLock()
+_reference_cache_directory = None
+_reference_cache: OrderedDict[tuple, Path] = OrderedDict()
 LOUDNESS_RANGE_LU = 7.0
 MAX_INTERNAL_PAUSE_SECONDS = 0.5
 INTERNAL_PAUSE_THRESHOLD_DBFS = -50.0
@@ -113,6 +125,39 @@ def _parse_loudness_measurements(stderr: str) -> dict[str, str]:
     return measurements
 
 
+def _reference_input_options(path: Path) -> list[str]:
+    """Bound file size and limit demuxers before FFmpeg can inspect an upload."""
+
+    if not path.is_file() or not 0 < path.stat().st_size <= MAX_REFERENCE_BYTES:
+        raise ValueError("Reference audio must be a nonempty file of at most 64 MiB")
+    return [
+        "-protocol_whitelist", "file,pipe",
+        "-format_whitelist", REFERENCE_FORMATS,
+        "-i", str(path.resolve()),
+        "-map", "0:a:0", "-vn", "-sn", "-dn",
+        "-t", str(MAX_REFERENCE_SECONDS + 1),
+    ]
+
+
+def _check_reference_duration(path: Path) -> None:
+    import soundfile as sf
+
+    info = sf.info(str(path))
+    if info.frames < 1 or info.duration > MAX_REFERENCE_SECONDS:
+        raise ValueError("Reference audio must be nonempty and at most 5 minutes long")
+
+
+def clear_reference_cache() -> None:
+    """Release process-owned preparation artifacts when the model shuts down."""
+
+    global _reference_cache_directory
+    with _reference_cache_lock:
+        _reference_cache.clear()
+        if _reference_cache_directory is not None:
+            _reference_cache_directory.cleanup()
+            _reference_cache_directory = None
+
+
 @contextmanager
 def normalized_reference_audio(
     path: str | Path,
@@ -132,8 +177,7 @@ def normalized_reference_audio(
         ffmpeg,
         "-nostdin",
         "-hide_banner",
-        "-i",
-        str(source),
+        *_reference_input_options(source),
         "-af",
         reference_loudness_filter(),
         "-f",
@@ -144,6 +188,7 @@ def normalized_reference_audio(
         measurement_command,
         capture_output=True,
         text=True,
+        timeout=REFERENCE_PROCESS_TIMEOUT,
     )
     if measured.returncode != 0:
         detail = measured.stderr.strip() or "unknown FFmpeg error"
@@ -165,8 +210,7 @@ def normalized_reference_audio(
             "-loglevel",
             "info",
             "-y",
-            "-i",
-            str(source),
+            *_reference_input_options(source),
             "-af",
             reference_loudness_filter(measurements),
             "-ar",
@@ -181,12 +225,14 @@ def normalized_reference_audio(
             normalization_command,
             capture_output=True,
             text=True,
+            timeout=REFERENCE_PROCESS_TIMEOUT,
         )
         if result.returncode != 0:
             detail = result.stderr.strip() or "unknown FFmpeg error"
             raise RuntimeError(f"FFmpeg failed to normalize reference audio: {detail}")
         if not normalized.is_file() or normalized.stat().st_size == 0:
             raise RuntimeError("FFmpeg did not produce normalized reference audio")
+        _check_reference_duration(normalized)
         output = _parse_loudness_measurements(result.stderr)
         print(
             "[Reference normalization] "
@@ -221,8 +267,7 @@ def denoise_reference_audio(
         "-loglevel",
         "error",
         "-y",
-        "-i",
-        str(source),
+        *_reference_input_options(source),
         "-ar",
         str(REFERENCE_DENOISE_SAMPLE_RATE),
         "-ac",
@@ -238,6 +283,7 @@ def denoise_reference_audio(
             conversion_command,
             capture_output=True,
             text=True,
+            timeout=REFERENCE_PROCESS_TIMEOUT,
         )
         if converted_result.returncode != 0:
             detail = converted_result.stderr.strip() or "unknown FFmpeg error"
@@ -248,31 +294,23 @@ def denoise_reference_audio(
         # pyrnnoise's file helper currently calls an obsolete audiolab Reader
         # attribute (``rate`` rather than ``sample_rate``). Feed its supported
         # array API directly so this path is independent of that adapter bug.
-        with wave.open(str(converted), "rb") as reader:
-            samples = np.frombuffer(
-                reader.readframes(reader.getnframes()),
-                dtype="<i2",
-            ).copy()
-        if samples.size == 0:
-            raise RuntimeError("Reference audio is empty after RNNoise conversion")
-
+        _check_reference_duration(converted)
         denoiser = RNNoise(REFERENCE_DENOISE_SAMPLE_RATE)
-        denoised_frames = [
-            frame
-            for _speech_probability, frame in denoiser.denoise_chunk(
-                samples[np.newaxis, :],
-                partial=True,
-            )
-        ]
-        if not denoised_frames:
-            raise RuntimeError("RNNoise did not return any denoised audio frames")
-        denoised = np.concatenate(denoised_frames, axis=1).squeeze(0)
-        denoised_pcm = np.clip(denoised, -32768, 32767).astype("<i2")
-        with wave.open(str(destination), "wb") as writer:
+        frames_written = 0
+        with wave.open(str(converted), "rb") as reader, wave.open(str(destination), "wb") as writer:
             writer.setnchannels(1)
             writer.setsampwidth(2)
             writer.setframerate(REFERENCE_DENOISE_SAMPLE_RATE)
-            writer.writeframes(denoised_pcm.tobytes())
+            # Keep only one second of input and the current RNNoise frame live.
+            while content := reader.readframes(REFERENCE_DENOISE_SAMPLE_RATE):
+                samples = np.frombuffer(content, dtype="<i2").copy()
+                final = reader.tell() == reader.getnframes()
+                for _, frame in denoiser.denoise_chunk(samples[np.newaxis, :], partial=final):
+                    pcm = np.clip(frame, -32768, 32767).astype("<i2")
+                    writer.writeframes(pcm.tobytes())
+                    frames_written += pcm.size
+        if not frames_written:
+            raise RuntimeError("RNNoise did not return any denoised audio frames")
         if not destination.is_file() or destination.stat().st_size == 0:
             raise RuntimeError("RNNoise did not produce denoised reference audio")
         print(
@@ -286,7 +324,7 @@ def denoise_reference_audio(
 
 
 @contextmanager
-def prepared_reference_audio(
+def _prepare_reference_audio(
     path: str | Path,
     sample_rate: int,
     *,
@@ -324,6 +362,52 @@ def prepared_reference_audio(
             ffmpeg=ffmpeg,
         ) as normalized:
             yield normalized
+
+
+@contextmanager
+def prepared_reference_audio(
+    path: str | Path,
+    sample_rate: int,
+    *,
+    denoise: bool = False,
+    ffmpeg: str | None = None,
+) -> Iterator[Path]:
+    """Reuse bounded immutable preparation artifacts, including across copies.
+
+    Content keys detect replacement at the same filename and let a saved project
+    reuse exactly the processing heard in the upload preview. Hold the lock while
+    an artifact is borrowed so another request cannot evict an active reader.
+    """
+
+    global _reference_cache_directory
+    source = Path(path)
+    _reference_input_options(source)
+    with source.open("rb") as stream:
+        digest = hashlib.sha256()
+        while block := stream.read(1024 * 1024):
+            digest.update(block)
+    key = (digest.hexdigest(), int(sample_rate), bool(denoise), ffmpeg)
+    with _reference_cache_lock:
+        if _reference_cache_directory is None:
+            _reference_cache_directory = tempfile.TemporaryDirectory(prefix="chatterbox-prepared-")
+        cached = _reference_cache.get(key)
+        if cached is None or not cached.is_file():
+            with _prepare_reference_audio(source, sample_rate, denoise=denoise, ffmpeg=ffmpeg) as prepared:
+                cached = Path(_reference_cache_directory.name) / f"{uuid4().hex}.wav"
+                shutil.copyfile(prepared, cached)
+            _reference_cache[key] = cached
+        else:
+            print("[Reference preparation] Reusing verified prepared audio", flush=True)
+        _reference_cache.move_to_end(key)
+        try:
+            yield cached
+        finally:
+            total_bytes = sum(item.stat().st_size for item in _reference_cache.values() if item.is_file())
+            while len(_reference_cache) > 16 or total_bytes > REFERENCE_CACHE_BYTES:
+                _, expired = _reference_cache.popitem(last=False)
+                if expired.is_file():
+                    total_bytes -= expired.stat().st_size
+                    expired.unlink()
 
 
 def normalize_speech_wav(

@@ -30,6 +30,8 @@ class SamplingTests(unittest.TestCase):
         model.t3_config = SimpleNamespace(stop_speech_token=6562)
         model.t3 = _FakeT3()
         model._t3_generation_lock = threading.Lock()
+        model._inference_lock = threading.RLock()
+        model.flush_cuda_cache = True
         model.update_exaggeration = lambda cond_emb, exaggeration: cond_emb
 
         captured = {}
@@ -56,6 +58,8 @@ class SamplingTests(unittest.TestCase):
         model.t3_config = SimpleNamespace(stop_speech_token=6562)
         model.t3 = _FakeT3()
         model._t3_generation_lock = threading.Lock()
+        model._inference_lock = threading.RLock()
+        model.flush_cuda_cache = True
         model.update_exaggeration = lambda cond_emb, exaggeration: cond_emb
         source_prompts = [
             'Narration. “Bonjour, café!” [12]\u200b ★',
@@ -103,6 +107,8 @@ class SamplingTests(unittest.TestCase):
         model.t3_config = SimpleNamespace(stop_speech_token=6562)
         model.t3 = _FakeT3()
         model._t3_generation_lock = threading.Lock()
+        model._inference_lock = threading.RLock()
+        model.flush_cuda_cache = True
         model.update_exaggeration = lambda cond_emb, exaggeration: cond_emb
 
         output = io.StringIO()

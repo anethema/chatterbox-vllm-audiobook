@@ -50,7 +50,14 @@ _LENGTH_TENSOR = torch.tensor(1000 + 1)  # max_new_tokens
 def drop_invalid_tokens(x):
     """Returns only tokens between SOS and EOS using a mask. No syncs."""
     assert x.dim() == 1 or (x.dim() == 2 and x.size(0) == 1)
-    x = x.squeeze(0)
+    x = x.reshape(-1)
+    if x.numel() == 0:
+        return x
+    if x.device.type == "cpu":
+        tokens = x.tolist()
+        start = tokens.index(SOS) + 1 if SOS in tokens else 0
+        end = tokens.index(EOS) if EOS in tokens else len(tokens)
+        return x[start:max(start, end)]
 
     length = x.size(0)
     idx = torch.arange(length, device=x.device)
