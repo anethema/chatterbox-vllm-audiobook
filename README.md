@@ -2,7 +2,7 @@
 
 Turn DRM-free EPUB books into chaptered M4B audiobooks with Chatterbox TTS and vLLM. This fork adds a Gradio web interface, sentence-aware EPUB processing, batched GPU generation, resumable projects, optional reference denoising, generated-audio quality recovery, loudness normalization, and parallel FFmpeg assembly to [randombk/chatterbox-vllm](https://github.com/randombk/chatterbox-vllm).
 
-The web interface currently targets English narration and defaults to the pinned **Chatterbox Multilingual V3 model in English mode**. The original English and Multilingual V2 checkpoints remain selectable through environment variables for compatibility with older projects.
+The web interface currently targets English narration and defaults to the pinned **Chatterbox Multilingual V3 model in English mode**. Choose Original English, Multilingual V2, or Multilingual V3 under **More options → Speech model**. Missing files download automatically with progress; downloaded checkpoints are cached for reuse.
 
 > [!IMPORTANT]
 > This project requires Linux or WSL2 and an NVIDIA CUDA GPU. Native Windows execution is not supported. It reads ordinary DRM-free EPUB files; it does not remove DRM.
@@ -237,7 +237,7 @@ The **Stop Generation** button requests an orderly stop. It works from any brows
 
 To resume:
 
-1. Restart the app with the same model used by the project.
+1. Select the same model used by the project under **More options → Speech model** and wait until it is ready.
 2. Expand **Resume an incomplete project**.
 3. Click **Refresh Incomplete Projects** if necessary.
 4. Select the project; its saved EPUB and reference audio load automatically.
@@ -264,6 +264,8 @@ CHATTERBOX_MODEL_VARIANT=english-v1 ./run_chatterbox_vllm.sh
 CHATTERBOX_MODEL_VARIANT=multilingual-v2 ./run_chatterbox_vllm.sh
 CHATTERBOX_MODEL_VARIANT=multilingual-v3 ./run_chatterbox_vllm.sh
 ~~~
+
+Change the running model under **More options → Speech model**. Selection automatically checks the cache, downloads missing files with file/transfer progress, then loads the model into GPU memory. **Load / Retry** retries a failed selection. Downloads finish before the previous model is released, so download failures leave it available. Switching waits for active generation to finish and affects all browser sessions; only one model occupies the GPU at a time. The status display shows download, loading, ready, and failure states even after reconnecting. A queued job whose selection no longer matches the active model asks you to load that selection before generating. The launch environment variable still sets the initial model after a server restart.
 
 The active model is shown at the top of the page and stored in new project metadata. Although V3 uses the multilingual model and tokenizer, this audiobook UI currently invokes it in English mode and does not expose a language selector.
 

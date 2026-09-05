@@ -13,7 +13,6 @@ from collections import Counter, OrderedDict
 
 import librosa
 import torch
-from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file
 
 from chatterbox_vllm.models.t3.modules.t3_config import T3Config
@@ -26,6 +25,7 @@ from .models.t3 import SPEECH_TOKEN_OFFSET
 from .models.t3.modules.cond_enc import T3Cond, T3CondEnc
 from .models.t3.modules.learned_pos_emb import LearnedPositionEmbeddings
 from .text_utils import prepare_tts_text, SUPPORTED_LANGUAGES
+from .model_download import ENGLISH_V1_REVISION, ensure_model_downloaded
 from .model_variants import (
     ENGLISH_V1_MODEL_ID,
     MULTILINGUAL_CHECKPOINTS,
@@ -45,6 +45,16 @@ def _model_operation(function):
                 raise RuntimeError("The speech model has been shut down")
             return function(self, *args, **kwargs)
     return guarded
+
+
+def _shutdown_t3_engine(t3):
+    """Stop worker resources even when the LLM still has Python references."""
+    engine = getattr(t3, "llm_engine", None)
+    backend = getattr(engine, "engine_core", None)
+    if backend is None:
+        backend = getattr(engine, "model_executor", None)
+    if backend is not None:
+        backend.shutdown()
 
 
 class T3WorkerExtension:
@@ -219,42 +229,47 @@ class ChatterboxTTS:
 
         t3 = LLM(**{**base_vllm_kwargs, **kwargs})
 
-        ve = VoiceEncoder()
-        ve.load_state_dict(load_file(ckpt_dir / "ve.safetensors"))
-        ve = ve.to(device=target_device).eval()
+        try:
+            ve = VoiceEncoder()
+            ve.load_state_dict(load_file(ckpt_dir / "ve.safetensors"))
+            ve = ve.to(device=target_device).eval()
 
-        s3gen = S3Gen(use_fp16=s3gen_use_fp16)
-        s3gen.load_state_dict(load_file(ckpt_dir / "s3gen.safetensors"), strict=False)
-        s3gen = s3gen.to(device=target_device).eval()
+            s3gen = S3Gen(use_fp16=s3gen_use_fp16)
+            s3gen.load_state_dict(load_file(ckpt_dir / "s3gen.safetensors"), strict=False)
+            s3gen = s3gen.to(device=target_device).eval()
 
-        default_conds = Conditionals.load(ckpt_dir / "conds.pt")
-        default_conds.to(device=target_device)
+            default_conds = Conditionals.load(ckpt_dir / "conds.pt")
+            default_conds.to(device=target_device)
 
-        return cls(
-            target_device=target_device, max_model_len=max_model_len,
-            t3=t3, t3_config=t3_config, t3_cond_enc=t3_enc, t3_speech_emb=t3_speech_emb, t3_speech_pos_emb=t3_speech_pos_emb,
-            s3gen=s3gen, ve=ve, default_conds=default_conds,
-            variant=variant, model_id=model_id,
-        )
+            return cls(
+                target_device=target_device, max_model_len=max_model_len,
+                t3=t3, t3_config=t3_config, t3_cond_enc=t3_enc, t3_speech_emb=t3_speech_emb, t3_speech_pos_emb=t3_speech_pos_emb,
+                s3gen=s3gen, ve=ve, default_conds=default_conds,
+                variant=variant, model_id=model_id,
+            )
+        except BaseException:
+            # A decoder/conditioning load failure must not strand a vLLM worker
+            # on the GPU, otherwise the UI's next Load / Retry cannot succeed.
+            _shutdown_t3_engine(t3)
+            raise
 
     @classmethod
     def from_pretrained(cls,
                         repo_id: str = REPO_ID,
-                        revision: str = "1b475dffa71fb191cb6d5901215eb6f55635a9b6",
+                        revision: str = ENGLISH_V1_REVISION,
                         *args, **kwargs) -> 'ChatterboxTTS':
         """Download the pinned English weights and link them for the vLLM loader."""
 
-        for fpath in ["ve.safetensors", "t3_cfg.safetensors", "s3gen.safetensors", "tokenizer.json", "conds.pt"]:
-            local_path = hf_hub_download(repo_id=repo_id, filename=fpath, revision=revision)
+        ckpt_dir = ensure_model_downloaded(ENGLISH_V1_MODEL_ID, repo_id=repo_id, revision=revision)
 
         # Ensure the symlink in './t3-model/model.safetensors' points to t3_cfg_path
-        t3_cfg_path = Path(local_path).parent / "t3_cfg.safetensors"
+        t3_cfg_path = ckpt_dir / "t3_cfg.safetensors"
         model_safetensors_path = Path.cwd() / "t3-model" / "model.safetensors"
         model_safetensors_path.unlink(missing_ok=True)
         model_safetensors_path.symlink_to(t3_cfg_path)
 
         return cls.from_local(
-            Path(local_path).parent,
+            ckpt_dir,
             variant="english",
             model_id=ENGLISH_V1_MODEL_ID,
             *args,
@@ -274,17 +289,16 @@ class ChatterboxTTS:
             raise ValueError("Use from_pretrained() for the original English model")
         t3_filename, default_revision = MULTILINGUAL_CHECKPOINTS[model_id]
         revision = revision or default_revision
-        for fpath in ["ve.safetensors", t3_filename, "s3gen.safetensors", "grapheme_mtl_merged_expanded_v1.json", "conds.pt", "Cangjie5_TC.json"]:
-            local_path = hf_hub_download(repo_id=repo_id, filename=fpath, revision=revision)
+        ckpt_dir = ensure_model_downloaded(model_id, repo_id=repo_id, revision=revision)
 
         # Ensure the symlink in './t3-model-multilingual/model.safetensors' points to t3_cfg_path
-        t3_cfg_path = Path(local_path).parent / t3_filename
+        t3_cfg_path = ckpt_dir / t3_filename
         model_safetensors_path = Path.cwd() / "t3-model-multilingual" / "model.safetensors"
         model_safetensors_path.unlink(missing_ok=True)
         model_safetensors_path.symlink_to(t3_cfg_path)
 
         return cls.from_local(
-            Path(local_path).parent,
+            ckpt_dir,
             variant="multilingual",
             model_id=model_id,
             *args,
@@ -597,12 +611,7 @@ class ChatterboxTTS:
                 # vLLM 0.10's V1 worker client owns subprocesses and sockets.
                 # Dropping LLM alone is insufficient when traceback frames or
                 # other references keep it alive; stop its resources explicitly.
-                engine = getattr(self.t3, "llm_engine", None)
-                backend = getattr(engine, "engine_core", None)
-                if backend is None:
-                    backend = getattr(engine, "model_executor", None)
-                if backend is not None:
-                    backend.shutdown()
+                _shutdown_t3_engine(self.t3)
             finally:
                 self._conditioning_cache.clear()
                 for name in ("t3", "s3gen", "ve", "default_conds", "t3_cond_enc", "t3_speech_emb", "t3_speech_pos_emb"):

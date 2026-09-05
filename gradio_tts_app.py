@@ -4,6 +4,7 @@ import argparse
 from dataclasses import dataclass
 from functools import wraps
 import inspect
+from html import escape
 import json
 import os
 from pathlib import Path
@@ -57,6 +58,7 @@ from chatterbox_vllm.m4b import (
 from chatterbox_vllm.memory import read_memory_status, release_unused_memory
 from chatterbox_vllm.model_variants import (
     DEFAULT_MODEL_ID,
+    MODEL_LABELS,
     MULTILINGUAL_V3_MODEL_ID,
     model_label,
     resolve_model_id,
@@ -81,6 +83,7 @@ from chatterbox_vllm.projects import (
 )
 from chatterbox_vllm.job_status import JobStatusStore, render_job_status
 from chatterbox_vllm.progress import GenerationControl, estimate_progress, format_duration
+from chatterbox_vllm.model_download import ensure_model_downloaded
 from chatterbox_vllm.tts import ChatterboxTTS
 
 
@@ -149,6 +152,8 @@ job_status = JobStatusStore(OUTPUT_ROOT)
 reference_preview_directory: tempfile.TemporaryDirectory | None = None
 reference_preview_lock = threading.RLock()
 generation_task_lock = threading.Lock()
+model_status_lock = threading.Lock()
+model_status = {"message": "Model has not been loaded yet.", "fraction": None, "busy": False}
 
 
 class GenerationStopped(Exception):
@@ -387,20 +392,105 @@ def prepare_uploaded_reference(
     )
 
 
-def load_model():
-    """Load the configured checkpoint before Gradio starts accepting jobs."""
+def _set_model_status(message, fraction=None, *, busy=False):
+    with model_status_lock:
+        model_status.update(message=message, fraction=fraction, busy=busy)
 
-    print(f"Loading {model_label(ACTIVE_MODEL_ID)} ({ACTIVE_MODEL_ID})...")
-    global global_model
-    global_model = ChatterboxTTS.from_model_id(
-        ACTIVE_MODEL_ID,
+
+def _model_monitor_render():
+    """Share active-model and download status with every connected browser."""
+    with model_status_lock:
+        status = dict(model_status)
+    current = global_model
+    active = (
+        f"**Active model:** {model_label(current.model_id)} (`{current.model_id}`)"
+        if current is not None else "**Active model:** None — select a model to load."
+    )
+    fraction = status["fraction"]
+    bar = ""
+    if status["busy"]:
+        value = f' value="{max(0.0, min(1.0, fraction))}"' if fraction is not None else ""
+        bar = f'<progress max="1"{value} style="width:100%" aria-label="Model preparation progress"></progress>'
+    return active, f'<div role="status">{escape(status["message"])}{bar}</div>'
+
+
+def _initial_model_selection():
+    """Fresh browser sessions start with the current server model selected."""
+    current = global_model
+    return current.model_id if current is not None else ACTIVE_MODEL_ID
+
+
+def load_model(model_id=None):
+    """Load a checkpoint; callers reserve the generation slot for replacements."""
+    global global_model, ACTIVE_MODEL_ID
+    target = resolve_model_id(model_id or ACTIVE_MODEL_ID)
+    print(f"Loading {model_label(target)} ({target})...")
+    _set_model_status(f"Loading {model_label(target)} into GPU memory…", busy=True)
+    loaded = ChatterboxTTS.from_model_id(
+        target,
         gpu_memory_utilization=0.6,
         max_model_len=1000,
-
         # Disable CUDA graphs - it's causing tensors to get corrupted right now.
         enforce_eager=True,
     )
-    return global_model
+    global_model = loaded
+    ACTIVE_MODEL_ID = target
+    _set_model_status(f"Ready: {model_label(target)}. Downloaded models stay cached for reuse.")
+    return loaded
+
+
+def switch_model(selected_model, progress=gr.Progress()):
+    """Download first, then replace the engine while holding its shared job slot."""
+    target = resolve_model_id(selected_model)
+    # The Gradio event also shares the generation queue. The lock protects API
+    # and direct callers and never interrupts an in-flight audiobook or sample.
+    with generation_task_lock:
+        if global_model is not None and global_model.model_id == target:
+            _set_model_status(f"Ready: {model_label(target)}. Downloaded models stay cached for reuse.")
+            return f"Ready: {model_label(target)}."
+
+        def report(fraction, message):
+            _set_model_status(message, fraction, busy=True)
+            progress(fraction, desc=message)
+
+        try:
+            report(0, f"Checking downloaded files for {model_label(target)}…")
+            ensure_model_downloaded(target, report)
+            _set_model_status(f"Loading {model_label(target)} into GPU memory…", busy=True)
+            progress(None, desc=f"Loading {model_label(target)} into GPU memory…")
+            _unload_model()
+            load_model(target)
+            return f"Ready: {model_label(target)}."
+        except Exception as error:
+            traceback.print_exc()
+            remaining = (
+                f"{model_label(global_model.model_id)} is still active."
+                if global_model is not None else "No model is loaded."
+            )
+            message = f"Could not load {model_label(target)}: {error}. {remaining} Select a model and click Load / Retry."
+            _set_model_status(message)
+            return message
+
+
+def _unload_model():
+    """Release the old worker and CUDA tensors before allocating a replacement."""
+    global global_model
+    previous = global_model
+    global_model = None
+    try:
+        if previous is not None:
+            previous.shutdown()
+    finally:
+        del previous
+        release_unused_memory()
+        torch.cuda.empty_cache()
+
+
+def _require_selected_model(selected_model):
+    if global_model is None:
+        raise gr.Error("No model is loaded. Select a model under More options and click Load / Retry.")
+    if selected_model is not None and resolve_model_id(selected_model) != global_model.model_id:
+        raise gr.Error("The selected model is not active. Load it under More options before generating.")
 
 
 def generation_arguments(exaggeration, cfg_weight, temperature, diffusion_steps,
@@ -475,11 +565,12 @@ def _audiobook_job(function):
 @_exclusive_sample
 def generate_sample(text, audio_prompt_path, denoise_reference, exaggeration,
                     cfg_weight, temperature, seed_num, diffusion_steps, min_p, top_p,
-                    repetition_penalty):
+                    repetition_penalty, selected_model=None):
     """Synthesize, recover, and normalize a preview with the selected voice."""
 
     if not text or not text.strip():
         raise gr.Error("Enter some text to synthesize.")
+    _require_selected_model(selected_model)
 
     seed = selected_seed(seed_num)
     args = generation_arguments(
@@ -1319,7 +1410,7 @@ def resume_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weight
                            temperature, seed_num, diffusion_steps, min_p,
                            top_p, repetition_penalty, max_chars, batch_size,
                            denoise_reference, resume_project_name,
-                           progress=gr.Progress()):
+                           progress=gr.Progress(), selected_model=None):
     """Resume an explicit project or the latest safely resumable monitored job."""
 
     project_name = _monitored_resume_project_name(resume_project_name)
@@ -1328,7 +1419,7 @@ def resume_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weight
     return generate_epub_audiobook(
         epub_path, audio_prompt_path, exaggeration, cfg_weight, temperature,
         seed_num, diffusion_steps, min_p, top_p, repetition_penalty, max_chars,
-        batch_size, denoise_reference, project_name, progress,
+        batch_size, denoise_reference, project_name, progress, selected_model,
     )
 
 
@@ -1337,7 +1428,7 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
                             temperature, seed_num, diffusion_steps, min_p,
                             top_p, repetition_penalty, max_chars, batch_size,
                             denoise_reference, resume_project_name,
-                            progress=gr.Progress()):
+                            progress=gr.Progress(), selected_model=None):
     """Coordinate durable project setup, repair, generation, and M4B assembly."""
 
     resuming = bool(resume_project_name)
@@ -1362,6 +1453,7 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
         generation_control.finish()
         return None, "❌ Upload or record reference audio once so it can be saved with this project."
 
+    _require_selected_model(selected_model)
     project_dir = None
     chunks = []
     completed_chunks = 0
@@ -2205,9 +2297,10 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
 with gr.Blocks(title="Chatterbox vLLM Audiobook", css=JOB_MONITOR_CSS, delete_cache=(3600, 86400)) as demo:
     gr.Markdown(
         "# Chatterbox vLLM\n"
-        "Quick voice tests and batched EPUB audiobook generation.  \n"
-        f"**Active model:** {model_label(ACTIVE_MODEL_ID)} (`{ACTIVE_MODEL_ID}`)"
+        "Quick voice tests and batched EPUB audiobook generation."
     )
+
+    active_model_display = gr.Markdown(f"**Active model:** {model_label(ACTIVE_MODEL_ID)} (`{ACTIVE_MODEL_ID}`)")
 
     with gr.Row():
         with gr.Column(scale=1):
@@ -2240,6 +2333,15 @@ with gr.Blocks(title="Chatterbox vLLM Audiobook", css=JOB_MONITOR_CSS, delete_ca
                 value=.5,
             )
             with gr.Accordion("More options", open=False):
+                model_selector = gr.Dropdown(
+                    choices=[(label, model_id) for model_id, label in MODEL_LABELS.items()],
+                    value=ACTIVE_MODEL_ID,
+                    label="Speech model",
+                    info="Selection loads the model automatically, downloading missing files. Switching waits for active generation and applies to all browser sessions.",
+                )
+                model_load_btn = gr.Button("Load / Retry")
+                model_download_status = gr.HTML("")
+                model_action_status = gr.Markdown("")
                 seed_num = gr.Number(value=0, label="Random seed (0 for random)")
                 diffusion_steps = gr.Slider(
                     1, 15, step=1,
@@ -2317,6 +2419,17 @@ with gr.Blocks(title="Chatterbox vLLM Audiobook", css=JOB_MONITOR_CSS, delete_ca
                 audio_output = gr.Audio(label="Output Audio")
 
     job_monitor_timer = gr.Timer(1.5)
+    demo.load(fn=_initial_model_selection, outputs=model_selector, queue=False)
+    demo.load(fn=_model_monitor_render, outputs=[active_model_display, model_download_status], queue=False)
+    job_monitor_timer.tick(fn=_model_monitor_render, outputs=[active_model_display, model_download_status], queue=False)
+    model_selector.input(
+        fn=switch_model, inputs=model_selector, outputs=model_action_status,
+        concurrency_id="model-generation", trigger_mode="always_last",
+    )
+    model_load_btn.click(
+        fn=switch_model, inputs=model_selector, outputs=model_action_status,
+        concurrency_id="model-generation",
+    )
     demo.load(
         fn=_job_monitor_render,
         outputs=[job_monitor, stop_epub_btn, epub_btn, resume_epub_btn],
@@ -2345,7 +2458,7 @@ with gr.Blocks(title="Chatterbox vLLM Audiobook", css=JOB_MONITOR_CSS, delete_ca
         inputs=[
             text, reference_source, denoise_reference, exaggeration, cfg_weight,
             temp, seed_num,
-            diffusion_steps, min_p, top_p, repetition_penalty,
+            diffusion_steps, min_p, top_p, repetition_penalty, model_selector,
         ],
         outputs=audio_output,
         concurrency_id="model-generation",
@@ -2365,7 +2478,7 @@ with gr.Blocks(title="Chatterbox vLLM Audiobook", css=JOB_MONITOR_CSS, delete_ca
         inputs=[
             epub_file, reference_source, exaggeration, cfg_weight, temp, seed_num,
             diffusion_steps, min_p, top_p, repetition_penalty, max_chars,
-            batch_size, denoise_reference, new_project_state,
+            batch_size, denoise_reference, new_project_state, model_selector,
         ],
         # Keep the textual result hidden while this event is running. Making a
         # visible Markdown component a live output causes Gradio to render the
@@ -2378,7 +2491,7 @@ with gr.Blocks(title="Chatterbox vLLM Audiobook", css=JOB_MONITOR_CSS, delete_ca
         inputs=[
             epub_file, reference_source, exaggeration, cfg_weight, temp, seed_num,
             diffusion_steps, min_p, top_p, repetition_penalty, max_chars,
-            batch_size, denoise_reference, resume_project,
+            batch_size, denoise_reference, resume_project, model_selector,
         ],
         outputs=[epub_audio_output, epub_result_status],
         concurrency_id="model-generation",
