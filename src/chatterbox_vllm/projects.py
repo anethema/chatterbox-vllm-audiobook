@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 from uuid import uuid4
 import wave
 
@@ -48,10 +49,23 @@ def wav_file_identity(path: str | Path) -> dict[str, int] | None:
         status = Path(path).stat()
     except OSError:
         return None
-    if not Path(path).is_file():
+    if not stat.S_ISREG(status.st_mode):
         return None
     return {"size": int(status.st_size), "mtime_ns": int(status.st_mtime_ns)}
 
+
+def _write_json_atomically(path: Path, data: object, *, indent: int | None = None) -> None:
+    """Replace ``path`` only after its complete JSON payload reaches a temp file."""
+
+    temporary = path.with_name(f".{path.name}-{uuid4().hex}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(data, indent=indent) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 def _parse_quality_scan_checkpoint(data: object, processing_signature=None) -> dict[int, dict[str, int]]:
     """Read a strict quality-scan cache, failing safely on malformed data."""
@@ -133,7 +147,6 @@ def write_quality_scan_checkpoint(
 
     project = Path(project_dir)
     checkpoint_path = project / PROJECT_QUALITY_SCAN_NAME
-    temporary = project / f".{PROJECT_QUALITY_SCAN_NAME}-{uuid4().hex}.tmp"
     clean_entries = {
         f"{index:06d}": identity
         for index, identity in sorted(verified_clean_chunks.items())
@@ -157,11 +170,7 @@ def write_quality_scan_checkpoint(
     }
     if processing_signature is not None:
         data["processing_signature"] = processing_signature
-    try:
-        temporary.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-        os.replace(temporary, checkpoint_path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    _write_json_atomically(checkpoint_path, data, indent=2)
     return checkpoint_path
 
 
@@ -193,15 +202,16 @@ def load_quality_summary(project_dir: Path, total_chunks: int) -> tuple[set[int]
 
 def write_quality_summary(project_dir: Path, total_chunks: int, detected: set[int], fixed: set[int], retained: set[int]) -> None:
     path = project_dir / "quality-summary.json"
-    temporary = project_dir / f".quality-summary-{uuid4().hex}.tmp"
-    try:
-        temporary.write_text(json.dumps({
-            "version": 1, "total_chunks": total_chunks,
-            "detected": sorted(detected), "fixed": sorted(fixed), "retained": sorted(retained),
-        }) + "\n", encoding="utf-8")
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    _write_json_atomically(
+        path,
+        {
+            "version": 1,
+            "total_chunks": total_chunks,
+            "detected": sorted(detected),
+            "fixed": sorted(fixed),
+            "retained": sorted(retained),
+        },
+    )
 
 
 def project_model_id(metadata: dict) -> str:
@@ -227,6 +237,8 @@ def _project_directory(output_root: str | Path, project_name: str) -> Path:
 
 
 def load_project_metadata(output_root: str | Path, project_name: str) -> tuple[Path, dict]:
+    """Load an incomplete project's metadata after validating its layout."""
+
     project = _project_directory(output_root, project_name)
     metadata_path = project / "metadata.json"
     chunks_dir = project / "chunks"
@@ -261,22 +273,23 @@ def write_project_progress(
     completed_chunks: int,
     scheduled_chunks: int,
 ) -> Path:
-    project = Path(project_dir)
-    progress_path = project / PROJECT_PROGRESS_NAME
-    temporary = project / f".{PROJECT_PROGRESS_NAME}-{uuid4().hex}.tmp"
-    data = {
-        "completed_chunks": int(completed_chunks),
-        "scheduled_chunks": int(scheduled_chunks),
-    }
-    try:
-        temporary.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-        os.replace(temporary, progress_path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    """Atomically save the small counters used to refresh resume choices."""
+
+    progress_path = Path(project_dir) / PROJECT_PROGRESS_NAME
+    _write_json_atomically(
+        progress_path,
+        {
+            "completed_chunks": int(completed_chunks),
+            "scheduled_chunks": int(scheduled_chunks),
+        },
+        indent=2,
+    )
     return progress_path
 
 
 def saved_project_inputs(project_dir: str | Path) -> tuple[Path | None, Path | None]:
+    """Return the retained EPUB and most recently modified voice reference."""
+
     inputs = Path(project_dir) / PROJECT_INPUTS_DIRECTORY
     epub = inputs / PROJECT_EPUB_NAME
     references = sorted(
@@ -331,6 +344,8 @@ def persist_project_inputs(
 
 
 def incomplete_project_choices(output_root: str | Path) -> list[tuple[str, str]]:
+    """List resumable projects with a display label, newest project first."""
+
     root = Path(output_root)
     if not root.is_dir():
         return []

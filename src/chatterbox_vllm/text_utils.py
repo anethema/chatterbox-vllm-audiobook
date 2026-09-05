@@ -111,10 +111,7 @@ def prepare_tts_text(text: str) -> tuple[str, Counter[str]]:
 
 
 def punc_norm(text: str) -> str:
-    """
-        Quick cleanup func for punctuation from LLMs or
-        containing chars not seen often in the dataset
-    """
+    """Normalize whitespace and uncommon punctuation for the speech model."""
     if len(text) == 0:
         return "You need to add some text for me to talk."
 

@@ -18,41 +18,6 @@ import logging
 
 import torch
 
-'''
-def subsequent_mask(
-        size: int,
-        device: torch.device = torch.device("cpu"),
-) -> torch.Tensor:
-    """Create mask for subsequent steps (size, size).
-
-    This mask is used only in decoder which works in an auto-regressive mode.
-    This means the current step could only do attention with its left steps.
-
-    In encoder, fully attention is used when streaming is not necessary and
-    the sequence is not long. In this  case, no attention mask is needed.
-
-    When streaming is need, chunk-based attention is used in encoder. See
-    subsequent_chunk_mask for the chunk-based attention mask.
-
-    Args:
-        size (int): size of mask
-        str device (str): "cpu" or "cuda" or torch.Tensor.device
-        dtype (torch.device): result dtype
-
-    Returns:
-        torch.Tensor: mask
-
-    Examples:
-        >>> subsequent_mask(3)
-        [[1, 0, 0],
-         [1, 1, 0],
-         [1, 1, 1]]
-    """
-    ret = torch.ones(size, size, device=device, dtype=torch.bool)
-    return torch.tril(ret)
-'''
-
-
 def subsequent_chunk_mask(
         size: int,
         chunk_size: int,
@@ -160,12 +125,13 @@ def add_optional_chunk_mask(xs: torch.Tensor,
     else:
         chunk_masks = masks
     assert chunk_masks.dtype == torch.bool
-    if (chunk_masks.sum(dim=-1) == 0).sum().item() != 0:
+    empty_rows = chunk_masks.sum(dim=-1) == 0
+    if empty_rows.any().item():
         logging.warning(
             "get chunk_masks found an all-false timestep; forcing it true so "
             "downstream computation can apply the intended mask"
         )
-        chunk_masks[chunk_masks.sum(dim=-1)==0] = True
+        chunk_masks[empty_rows] = True
     return chunk_masks
 
 

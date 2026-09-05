@@ -1,3 +1,5 @@
+"""Gradio callbacks coordinating voice previews and resumable audiobook jobs."""
+
 import argparse
 from dataclasses import dataclass
 from functools import wraps
@@ -150,11 +152,11 @@ generation_task_lock = threading.Lock()
 
 
 class GenerationStopped(Exception):
-    pass
+    """Signal a cooperative stop after the current indivisible operation."""
 
 
 class MemoryPressureError(RuntimeError):
-    pass
+    """Pause before the next GPU batch when Linux memory is critically low."""
 
 
 class GeneratedAudioValidationError(ValueError):
@@ -169,6 +171,8 @@ class GeneratedAudioQualityError(GeneratedAudioValidationError):
 
 @dataclass(frozen=True)
 class RecoveredWaveform:
+    """Carry the selected audio and its repair history into durable saving."""
+
     waveform: torch.Tensor
     detected_quality_issues: bool
     retained_quality_issues: tuple[AudioQualityIssue, ...]
@@ -177,6 +181,8 @@ class RecoveredWaveform:
 
 @dataclass(frozen=True)
 class RecoveredSplitPart:
+    """Preserve warnings when recovered sentence parts are joined together."""
+
     waveform: torch.Tensor
     retained_quality_issues: tuple[AudioQualityIssue, ...]
     retained_with_warning: bool = False
@@ -291,6 +297,8 @@ def _log_project_quality_summary(
 
 
 def set_seed(seed: int):
+    """Seed local random generators used alongside the vLLM sampling seed."""
+
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -301,6 +309,8 @@ def set_seed(seed: int):
 
 
 def selected_seed(seed_num) -> int | None:
+    """Interpret the UI value zero as random; apply explicit seeds locally."""
+
     seed = int(seed_num or 0)
     if seed == 0:
         return None
@@ -351,12 +361,16 @@ def delete_reference_preview(path: str | None) -> None:
 
 
 def update_reference_preview(source, denoise, previous):
+    """Replace the session preview after preparing its successor successfully."""
+
     preview = prepare_reference_preview(source, denoise)
     delete_reference_preview(previous)
     return preview, preview
 
 
 def update_uploaded_reference(source, denoise, previous):
+    """Update the player and retain the original upload for future processing."""
+
     preview, state = update_reference_preview(source, denoise, previous)
     return preview, source, state
 
@@ -374,6 +388,8 @@ def prepare_uploaded_reference(
 
 
 def load_model():
+    """Load the configured checkpoint before Gradio starts accepting jobs."""
+
     print(f"Loading {model_label(ACTIVE_MODEL_ID)} ({ACTIVE_MODEL_ID})...")
     global global_model
     global_model = ChatterboxTTS.from_model_id(
@@ -389,6 +405,8 @@ def load_model():
 
 def generation_arguments(exaggeration, cfg_weight, temperature, diffusion_steps,
                          min_p, top_p, repetition_penalty, seed):
+    """Convert Gradio numeric values into the model sampling argument types."""
+
     return {
         "exaggeration": float(exaggeration),
         "cfg_weight": float(cfg_weight),
@@ -408,6 +426,8 @@ def _inference_arguments(settings: dict) -> dict:
 
 
 def _exclusive_sample(function):
+    """Reserve the shared model for a sample and release it on every exit."""
+
     @wraps(function)
     def guarded(*args, **kwargs):
         if not generation_task_lock.acquire(blocking=False):
@@ -421,13 +441,15 @@ def _exclusive_sample(function):
 
 def _audiobook_job(function):
     """Keep acquisition and every preflight failure inside one cleanup boundary."""
+    signature = inspect.signature(function)
+
     @wraps(function)
     def guarded(*args, **kwargs):
         if not generation_task_lock.acquire(blocking=False):
             return None, "⚠️ Another generation job is using the model."
         started = False
         try:
-            bound = inspect.signature(function).bind(*args, **kwargs)
+            bound = signature.bind(*args, **kwargs)
             started, _ = job_status.try_start(project_id=bound.arguments.get("resume_project_name") or None)
             if not started:
                 return None, "⚠️ Another audiobook job is already running."
@@ -454,6 +476,8 @@ def _audiobook_job(function):
 def generate_sample(text, audio_prompt_path, denoise_reference, exaggeration,
                     cfg_weight, temperature, seed_num, diffusion_steps, min_p, top_p,
                     repetition_penalty):
+    """Synthesize, recover, and normalize a preview with the selected voice."""
+
     if not text or not text.strip():
         raise gr.Error("Enter some text to synthesize.")
 
@@ -509,6 +533,8 @@ def generate_sample(text, audio_prompt_path, denoise_reference, exaggeration,
 
 
 def inspect_epub_file(epub_path, max_chars):
+    """Summarize readable chapters and chunk counts without starting inference."""
+
     if not epub_path:
         return "Upload a DRM-free EPUB to inspect its chapters before generation."
     try:
@@ -537,6 +563,8 @@ def _job_monitor_render():
 
 
 def request_generation_stop():
+    """Request cooperative cancellation and publish it to all browser sessions."""
+
     if not generation_control.request_stop():
         return "No EPUB generation is currently running."
     job_status.request_stop()
@@ -547,11 +575,15 @@ def request_generation_stop():
 
 
 def refresh_resume_projects():
+    """Refresh the project selector and clear any stale selection."""
+
     choices = incomplete_project_choices(OUTPUT_ROOT)
     return gr.Dropdown(choices=choices, value=None)
 
 
 def inspect_resume_project(project_name):
+    """Load saved inputs and reference settings for a resumable project."""
+
     if not project_name:
         return (
             "Select an incomplete project. Saved inputs will load automatically.",
@@ -592,6 +624,8 @@ def inspect_resume_project(project_name):
 
 
 def _safe_project_name(title: str) -> str:
+    """Build a bounded filesystem-safe name with a timestamp and unique suffix."""
+
     slug = re.sub(r"[^A-Za-z0-9._-]+", "-", title).strip("-._")
     return (slug[:80] or "audiobook") + "-" + time.strftime("%Y%m%d-%H%M%S") + "-" + uuid4().hex[:6]
 
@@ -603,6 +637,8 @@ def _waveform_for_save(
     *,
     allow_quality_issues: bool = False,
 ) -> torch.Tensor:
+    """Validate mono PCM shape, finite samples, duration, and optional quality."""
+
     if hasattr(waveform, "detach"):
         waveform = waveform.detach()
     try:
@@ -635,13 +671,17 @@ def _waveform_for_save(
         raise GeneratedAudioValidationError(
             f"Generated audio is implausibly long ({duration:.1f}s for {words} words)"
         )
-    issues = find_generated_audio_issues(
-        tensor.numpy(),
-        sample_rate,
-        include_vad=True,
-    )
-    if issues and not allow_quality_issues:
-        raise GeneratedAudioQualityError(issues)
+    # Best-effort recovery still requires valid audio, but its caller has
+    # already accepted quality warnings. Do not repeat a scan it cannot use;
+    # saved candidates are scanned again after normalization.
+    if not allow_quality_issues:
+        issues = find_generated_audio_issues(
+            tensor.numpy(),
+            sample_rate,
+            include_vad=True,
+        )
+        if issues:
+            raise GeneratedAudioQualityError(issues)
     return tensor
 
 
@@ -649,6 +689,8 @@ def _retry_generation_args(
     settings: dict,
     used_seeds: set[int] | None = None,
 ) -> dict:
+    """Copy sampling settings with a fresh seed, honoring cooperative stops."""
+
     if generation_control.stop_requested():
         raise GenerationStopped
     retry_args = dict(settings)
@@ -672,6 +714,8 @@ def _join_split_waveforms(
     waveforms: list[torch.Tensor],
     sample_rate: int,
 ) -> torch.Tensor:
+    """Join mono recovery parts with a short pause at each text boundary."""
+
     silence = torch.zeros(
         (1, max(1, round(sample_rate * SPLIT_JOIN_SILENCE_SECONDS))),
         dtype=torch.float32,
@@ -687,6 +731,8 @@ def _join_split_waveforms(
 def _quality_issues_from_error(
     error: GeneratedAudioValidationError | None,
 ) -> tuple[AudioQualityIssue, ...]:
+    """Extract detector findings while leaving structural failures separate."""
+
     if isinstance(error, GeneratedAudioQualityError):
         return tuple(error.issues)
     return ()
@@ -734,6 +780,8 @@ def _recover_split_part(
     generate_part,
     depth: int,
 ) -> RecoveredSplitPart:
+    """Retry one text part, recursively splitting within the configured limits."""
+
     last_error: GeneratedAudioValidationError | None = None
     last_audio = None
     for attempt in range(MAX_SPLIT_PART_ATTEMPTS):
@@ -859,6 +907,8 @@ def _recover_generated_waveform(
     regenerate_whole,
     generate_part,
 ) -> RecoveredWaveform:
+    """Try whole-chunk repair before bounded sentence splitting or fallback."""
+
     try:
         return RecoveredWaveform(
             _waveform_for_save(initial_audio, text, sample_rate),
@@ -1099,6 +1149,8 @@ def _write_metadata(path: Path, book: EpubBook, source_path: str, chunks: list[T
                     output_path: str | None = None,
                     scheduled: int | None = None,
                     chunks_available: bool = True):
+    """Atomically snapshot the text plan, saved inputs, and durable output state."""
+
     saved_epub, saved_reference = saved_project_inputs(path.parent)
     data = {
         "title": book.title,
@@ -1212,16 +1264,18 @@ def _record_durable_results(
         if on_result is not None:
             on_result(result)
         chunk_index = int(path.stem)
-        durable_indices.add(int(Path(path).stem))
+        # Only out-of-order completions beyond the durable prefix need tracking.
+        # A repaired earlier chunk must not accumulate in this pending set.
+        if chunk_index >= durable_chunks:
+            durable_indices.add(chunk_index)
         identity = wav_file_identity(path)
         if result.verified_clean and identity is not None:
             if verified_clean_chunks.get(chunk_index) != identity:
                 verified_clean_chunks[chunk_index] = identity
                 checkpoint_change_count += 1
-        else:
-            if chunk_index in verified_clean_chunks:
-                verified_clean_chunks.pop(chunk_index, None)
-                checkpoint_change_count += 1
+        elif chunk_index in verified_clean_chunks:
+            verified_clean_chunks.pop(chunk_index)
+            checkpoint_change_count += 1
     while durable_chunks in durable_indices:
         durable_indices.remove(durable_chunks)
         durable_chunks += 1
@@ -1229,6 +1283,8 @@ def _record_durable_results(
 
 
 def _protect_system_memory(batch_number: int) -> None:
+    """Release idle memory periodically and stop before headroom becomes unsafe."""
+
     status = read_memory_status()
     if (
         batch_number % MEMORY_CLEANUP_BATCHES == 0
@@ -1435,8 +1491,7 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
             if chunk_index >= durable_chunks
         ]
         for chunk_index in stale_checkpoint_indices:
-            if chunk_index >= durable_chunks:
-                verified_clean_chunks.pop(chunk_index)
+            verified_clean_chunks.pop(chunk_index)
         checkpoint_dirty_chunks = len(stale_checkpoint_indices)
         checkpoint_last_saved_at = time.monotonic()
 
@@ -1466,6 +1521,8 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
             checkpoint_last_saved_at = now
 
         def record_saved_result(result, *, retry_allowed=True):
+            """Account for final-file findings and queue each eligible repair once."""
+
             nonlocal checkpoint_dirty_chunks
             index = int(result.path.stem)
             finalized_indices.add(index)
@@ -1494,6 +1551,8 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
             checkpoint_dirty_chunks += 1
 
         def report_ready_batches():
+            """Report only batches whose final scans and bounded repairs have finished."""
+
             for start, count in list(unreported_batches):
                 indices = set(range(start, start + count))
                 if indices <= finalized_indices and not indices.intersection(final_quality_pending):
@@ -1502,6 +1561,8 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
                     finalized_indices.difference_update(indices)
 
         def collect_saved_results():
+            """Advance durable progress and publish completed worker quality findings."""
+
             nonlocal durable_chunks, checkpoint_dirty_chunks
             durable_chunks, changes = _record_durable_results(
                 audio_tasks, durable_indices, durable_chunks, verified_clean_chunks,
@@ -1640,7 +1701,6 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
                 max_workers=AUDIO_WORKERS,
                 max_pending=MAX_PENDING_AUDIO_TASKS,
             )
-        if remaining_chunks or damaged_chunks:
             pending_description = (
                 f"{len(remaining_chunks):,} remaining chunks"
                 if remaining_chunks
@@ -1658,15 +1718,13 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
                 audio_prompt_path,
                 denoise_reference=bool(denoise_reference),
             )
-        elif audio_tasks is not None:
-            progress(
-                0.975,
-                desc=f"Applying V3 pause limit to {durable_chunks:,} existing chunks",
-            )
         else:
             progress(0.975, desc="All speech chunks found; preparing M4B assembly")
+        # Project settings are immutable during a run. Copy only when assigning
+        # a batch seed; recovery always derives its own arguments and fresh seed.
+        inference_args = _inference_arguments(settings)
         repaired_chunks = []
-        retained_noisy_chunks = []
+        retained_noisy_chunks = set()
         # Phase 3: replace damaged durable chunks before generating new ones.
         if damaged_chunks:
             job_status.update(
@@ -1682,13 +1740,12 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
             if generation_control.stop_requested():
                 raise GenerationStopped
             chunk = chunks[chunk_index]
-            repair_args = _inference_arguments(settings)
             retry_seeds: set[int] = set()
             repaired = global_model.generate_with_conds(
                 [chunk.text],
                 s3gen_ref=s3gen_ref,
                 cond_emb=cond_emb,
-                **_retry_generation_args(repair_args, retry_seeds),
+                **_retry_generation_args(inference_args, retry_seeds),
             )[0]
             recovery = _recover_generated_waveform(
                 repaired,
@@ -1700,7 +1757,7 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
                         [chunk.text],
                         s3gen_ref=s3gen_ref,
                         cond_emb=cond_emb,
-                        **_retry_generation_args(repair_args, retry_seeds),
+                        **_retry_generation_args(inference_args, retry_seeds),
                     )[0]
                 ),
                 lambda part: (
@@ -1708,7 +1765,7 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
                         [part],
                         s3gen_ref=s3gen_ref,
                         cond_emb=cond_emb,
-                        **_retry_generation_args(repair_args, retry_seeds),
+                        **_retry_generation_args(inference_args, retry_seeds),
                     )[0]
                 ),
             )
@@ -1729,7 +1786,7 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
                 if chunk_index in verified_clean_chunks:
                     verified_clean_chunks.pop(chunk_index)
                     checkpoint_dirty_chunks += 1
-                retained_noisy_chunks.append(chunk_index)
+                retained_noisy_chunks.add(chunk_index)
                 quality_retained_chunks.add(chunk_index)
                 quality_fixed_chunks.discard(chunk_index)
                 detail = (
@@ -1776,7 +1833,7 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
             )
             retained_labels = (
                 ", ".join(
-                    f"{index:06d}.wav" for index in retained_noisy_chunks
+                    f"{index:06d}.wav" for index in sorted(retained_noisy_chunks)
                 )
                 if retained_noisy_chunks
                 else "none"
@@ -1822,7 +1879,7 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
                         f"of {len(chunks)}"
                     ),
                 )
-            batch_args = _inference_arguments(settings)
+            batch_args = dict(inference_args)
             if seed is not None:
                 batch_args["seed"] = seed + start
             audios = global_model.generate_with_conds(
@@ -1954,7 +2011,7 @@ def generate_epub_audiobook(epub_path, audio_prompt_path, exaggeration, cfg_weig
                     raise GenerationStopped
                 return global_model.generate_with_conds(
                     [text], s3gen_ref=s3gen_ref, cond_emb=cond_emb,
-                    **_retry_generation_args(_inference_arguments(settings), used_seeds),
+                    **_retry_generation_args(inference_args, used_seeds),
                 )[0]
 
             result = _repair_saved_chunk(
@@ -2363,6 +2420,8 @@ with gr.Blocks(title="Chatterbox vLLM Audiobook", css=JOB_MONITOR_CSS, delete_ca
 
 
 def parse_command_line():
+    """Parse launch options without starting the model or web server."""
+
     parser = argparse.ArgumentParser(description="Launch the Chatterbox vLLM web UI")
     parser.add_argument(
         "--share",

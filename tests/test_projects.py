@@ -3,6 +3,7 @@ import os
 import tempfile
 import unittest
 import wave
+from unittest.mock import patch
 from pathlib import Path
 
 from chatterbox_vllm.epub import EpubBook, EpubChapter, chunk_book
@@ -239,6 +240,33 @@ class ResumeProjectTests(unittest.TestCase):
         self.assertEqual(metadata["completed_chunks"], 7)
         self.assertEqual(metadata["scheduled_chunks"], 8)
         self.assertLess(progress_size, 200)
+
+    def test_atomic_progress_write_keeps_the_previous_file_on_replace_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = self.make_project(root)
+            progress_path = project / "progress.json"
+            progress_path.write_text('{"completed_chunks": 1}\n', encoding="utf-8")
+
+            with patch("chatterbox_vllm.projects.os.replace", side_effect=OSError):
+                with self.assertRaises(OSError):
+                    write_project_progress(project, 2, 3)
+
+            self.assertEqual(
+                progress_path.read_text(encoding="utf-8"),
+                '{"completed_chunks": 1}\n',
+            )
+            self.assertEqual(list(project.glob(".progress.json-*.tmp")), [])
+
+    def test_wav_identity_uses_its_initial_stat_result(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "chunk.wav"
+            write_wav(path)
+            with patch("chatterbox_vllm.projects.Path.is_file", side_effect=AssertionError):
+                identity = wav_file_identity(path)
+            expected_size = path.stat().st_size
+
+        self.assertEqual(identity["size"], expected_size)
 
     def test_legacy_project_without_quality_checkpoint_rescans_safely(self):
         with tempfile.TemporaryDirectory() as directory:

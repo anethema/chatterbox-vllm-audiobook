@@ -43,12 +43,12 @@ def drop_invalid_tokens_cuda_sync(x):
     x = x[s: e]
     return x
 
-# Pre-compute constants to avoid syncs
-_ZERO_TENSOR = torch.tensor(0)
-_LENGTH_TENSOR = torch.tensor(1000 + 1)  # max_new_tokens
-
 def drop_invalid_tokens(x):
-    """Returns only tokens between SOS and EOS using a mask. No syncs."""
+    """Return tokens strictly between the first SOS and first EOS marker.
+
+    The CUDA branch keeps marker selection on-device, but producing a
+    variable-length output can still synchronize in eager PyTorch.
+    """
     assert x.dim() == 1 or (x.dim() == 2 and x.size(0) == 1)
     x = x.reshape(-1)
     if x.numel() == 0:

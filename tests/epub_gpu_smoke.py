@@ -8,18 +8,22 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
+from unittest.mock import patch
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPOSITORY_ROOT))
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 from test_epub import make_epub  # noqa: E402
-import gradio_tts_app as app  # noqa: E402
+from chatterbox_vllm.job_status import JobStatusStore  # noqa: E402
+from chatterbox_vllm.projects import incomplete_project_choices  # noqa: E402
 
 
-def main() -> None:
-    source = Path("/tmp/chatterbox-epub-smoke.epub")
+def _run_scenarios(app, source: Path) -> None:
+    """Exercise generation, metadata, cooperative stop, and interrupted resume."""
+
     app.OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
     projects_before_test = set(app.OUTPUT_ROOT.iterdir())
     make_epub(source)
@@ -247,6 +251,30 @@ def main() -> None:
             if project.is_dir() and project.name.startswith("Test-Book-"):
                 shutil.rmtree(project)
         source.unlink(missing_ok=True)
+
+
+def main() -> None:
+    """Run real GPU scenarios without reading or updating users' saved projects."""
+
+    # Importing the UI loads its job checkpoint. Redirect that initialization,
+    # as well as all generated files, before importing it for the smoke test.
+    # Keep outputs below the repository for the app's relative metadata paths.
+    with tempfile.TemporaryDirectory(prefix=".gpu-smoke-", dir=REPOSITORY_ROOT) as directory:
+        root = Path(directory)
+        status = JobStatusStore(root / "outputs")
+        with patch.dict(os.environ, {
+            "GRADIO_TEMP_DIR": str(root / "gradio-cache"),
+            "GRADIO_ANALYTICS_ENABLED": "False",
+        }):
+            with patch("chatterbox_vllm.job_status.JobStatusStore", return_value=status), patch(
+                "chatterbox_vllm.projects.incomplete_project_choices", return_value=[],
+            ):
+                import gradio_tts_app as app
+
+            app.OUTPUT_ROOT = root / "outputs"
+            app.job_status = status
+            app.incomplete_project_choices = incomplete_project_choices
+            _run_scenarios(app, root / "source.epub")
 
 
 if __name__ == "__main__":

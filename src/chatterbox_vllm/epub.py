@@ -98,15 +98,25 @@ def _first_element(root: ET.Element, name: str) -> ET.Element | None:
     return next((element for element in root.iter() if _local_name(element.tag) == name), None)
 
 
-def _metadata_values(root: ET.Element, name: str) -> tuple[str, ...]:
-    values = []
+_PACKAGE_METADATA_NAMES = frozenset(
+    {"title", "creator", "language", "publisher", "description", "date", "identifier"}
+)
+
+
+def _package_metadata(root: ET.Element) -> tuple[dict[str, tuple[str, ...]], str | None]:
+    """Collect spoken-book metadata and the first legacy cover reference in one pass."""
+
+    values = {name: [] for name in _PACKAGE_METADATA_NAMES}
+    cover_id = None
     for element in root.iter():
-        if _local_name(element.tag) != name:
-            continue
-        value = " ".join("".join(element.itertext()).split())
-        if value:
-            values.append(value)
-    return tuple(values)
+        name = _local_name(element.tag)
+        if name == "meta" and cover_id is None and element.get("name") == "cover":
+            cover_id = element.get("content", "")
+        elif name in values:
+            value = " ".join("".join(element.itertext()).split())
+            if value:
+                values[name].append(value)
+    return {name: tuple(items) for name, items in values.items()}, cover_id
 
 
 def _safe_member_path(opf_path: str, href: str) -> str:
@@ -162,7 +172,8 @@ def load_epub(path: str | Path) -> EpubBook:
         except ET.ParseError as error:
             raise EpubError("EPUB package metadata is invalid") from error
 
-        titles = _metadata_values(package_root, "title")
+        metadata, cover_id = _package_metadata(package_root)
+        titles = metadata["title"]
         book_title = titles[0] if titles else ""
         if not book_title:
             book_title = epub_path.stem
@@ -222,11 +233,6 @@ def load_epub(path: str | Path) -> EpubBook:
         if not chapters:
             raise EpubError("EPUB contains no readable chapters in its spine")
 
-        cover_id = ""
-        for element in package_root.iter():
-            if _local_name(element.tag) == "meta" and element.get("name") == "cover":
-                cover_id = element.get("content", "")
-                break
         cover_item = manifest.get(cover_id) if cover_id else None
         if cover_item is None:
             cover_item = next(
@@ -253,13 +259,13 @@ def load_epub(path: str | Path) -> EpubBook:
             )
 
         def first_metadata(name: str) -> str:
-            values = _metadata_values(package_root, name)
+            values = metadata[name]
             return values[0] if values else ""
 
         return EpubBook(
             book_title,
             tuple(chapters),
-            authors=_metadata_values(package_root, "creator"),
+            authors=metadata["creator"],
             language=first_metadata("language"),
             publisher=first_metadata("publisher"),
             description=first_metadata("description"),
@@ -438,6 +444,8 @@ def split_text_for_recovery(text: str) -> list[str]:
 
 
 def chunk_book(book: EpubBook, max_chars: int = 280) -> list[TextChunk]:
+    """Chunk each chapter independently so chapter markers remain accurate."""
+
     chunks: list[TextChunk] = []
     for chapter_index, chapter in enumerate(book.chapters):
         chunks.extend(

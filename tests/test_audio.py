@@ -356,6 +356,54 @@ class GeneratedAudioQualityTests(unittest.TestCase):
             "near-silent generated audio at 0.00-3.00s",
         )
 
+    def near_silent_dc_offset_with_partial_tail(self) -> np.ndarray:
+        frame = self.sample_rate // 4
+        return np.concatenate(
+            [
+                np.full(frame, 0.10, dtype=np.float32),
+                np.full(frame, -0.10, dtype=np.float32),
+                np.full(frame, 0.06, dtype=np.float32),
+                np.full(self.sample_rate // 10, -0.04, dtype=np.float32),
+            ]
+        )
+
+    def test_near_silent_dc_offset_with_partial_tail_skips_spectral_analysis(self):
+        waveform = self.near_silent_dc_offset_with_partial_tail()
+
+        with patch(
+            "chatterbox_vllm.audio.np.fft.rfft",
+            side_effect=AssertionError("near-silent audio must not be transformed"),
+        ):
+            issues = find_generated_audio_issues(waveform, self.sample_rate)
+
+        self.assertEqual(
+            issues,
+            [AudioQualityIssue("near-silent generated audio", 0.0, 0.85)],
+        )
+
+    def test_near_silent_audio_still_includes_requested_vad_findings(self):
+        waveform = self.near_silent_dc_offset_with_partial_tail()
+
+        with patch(
+            "chatterbox_vllm.audio.default_silero_vad_detector."
+            "find_loud_no_speech_ranges",
+            return_value=(NoSpeechRange(0.5, 2.0),),
+        ) as detector:
+            issues = find_generated_audio_issues(
+                waveform,
+                self.sample_rate,
+                include_vad=True,
+            )
+
+        detector.assert_called_once()
+        self.assertEqual(
+            issues,
+            [
+                AudioQualityIssue("near-silent generated audio", 0.0, 0.85),
+                AudioQualityIssue("audible non-speech synthesis blob", 0.5, 2.0),
+            ],
+        )
+
     def test_detects_a_wholly_near_silent_waveform_shorter_than_a_frame(self):
         waveform = np.zeros(round(0.1 * self.sample_rate), dtype=np.float32)
 

@@ -140,6 +140,8 @@ def _reference_input_options(path: Path) -> list[str]:
 
 
 def _check_reference_duration(path: Path) -> None:
+    """Reject empty or overlong decoded references before feature extraction."""
+
     import soundfile as sf
 
     info = sf.info(str(path))
@@ -459,6 +461,8 @@ def normalize_speech_wav(
 
 
 def _quality_ranges(mask: np.ndarray, minimum_frames: int) -> list[tuple[int, int]]:
+    """Return half-open runs of flagged frames that meet the minimum length."""
+
     ranges: list[tuple[int, int]] = []
     start: int | None = None
     for index, flagged in enumerate(mask):
@@ -503,6 +507,26 @@ def _is_near_silent(samples: np.ndarray) -> bool:
     return rms_dbfs <= GENERATED_AUDIO_NEAR_SILENCE_MAXIMUM_DBFS
 
 
+def _append_vad_issues(
+    issues: list[AudioQualityIssue],
+    samples: np.ndarray,
+    sample_rate: int,
+) -> None:
+    """Append model-confirmed non-speech regions to waveform findings."""
+
+    for no_speech in default_silero_vad_detector.find_loud_no_speech_ranges(
+        samples,
+        sample_rate,
+    ):
+        issues.append(
+            AudioQualityIssue(
+                "audible non-speech synthesis blob",
+                no_speech.start_seconds,
+                no_speech.end_seconds,
+            )
+        )
+
+
 def find_generated_audio_issues(
     samples,
     sample_rate: int,
@@ -543,6 +567,23 @@ def find_generated_audio_issues(
         np.signbit(frames[:, :-1]) != np.signbit(frames[:, 1:]), axis=1
     )
 
+    # All spectral artifact detectors require audible frame levels, so an
+    # entirely near-silent clip cannot gain any spectral findings. Preserve
+    # the separately requested VAD pass while avoiding FFT allocations.
+    near_silent = rms_dbfs <= GENERATED_AUDIO_NEAR_SILENCE_MAXIMUM_DBFS
+    remainder = flattened[frame_count * frame_size :]
+    if np.all(near_silent) and _is_near_silent(remainder):
+        issues = [
+            AudioQualityIssue(
+                "near-silent generated audio",
+                0.0,
+                flattened.size / rate,
+            )
+        ]
+        if include_vad:
+            _append_vad_issues(issues, flattened, rate)
+        return sorted(issues, key=lambda issue: (issue.start_seconds, issue.end_seconds))
+
     window = np.hanning(frame_size).astype(np.float32)
     power = np.abs(np.fft.rfft(frames * window, axis=1)) ** 2
     power[:, 0] = 0
@@ -556,74 +597,65 @@ def find_generated_audio_issues(
 
     issues: list[AudioQualityIssue] = []
 
-    near_silent = rms_dbfs <= GENERATED_AUDIO_NEAR_SILENCE_MAXIMUM_DBFS
-    remainder = flattened[frame_count * frame_size :]
-    if np.all(near_silent) and _is_near_silent(remainder):
+    minimum_edge_samples = max(
+        1,
+        math.ceil(GENERATED_AUDIO_EDGE_SILENCE_MINIMUM_SECONDS * rate),
+    )
+    leading_end = 0
+    while leading_end < frame_count and near_silent[leading_end]:
+        leading_end += 1
+    leading_samples = leading_end * frame_size
+    if (
+        leading_samples < minimum_edge_samples
+        and flattened.size >= minimum_edge_samples
+        and _is_near_silent(flattened[:minimum_edge_samples])
+    ):
+        leading_samples = minimum_edge_samples
+    if leading_samples >= minimum_edge_samples:
         issues.append(
             AudioQualityIssue(
-                "near-silent generated audio",
+                "excessive leading near-silence",
                 0.0,
+                leading_samples / rate,
+            )
+        )
+
+    # Reframe from the end so an otherwise-valid 3-second tail is not
+    # shortened by a partial speech frame at its leading boundary.
+    trailing_frames = flattened[-frame_count * frame_size :].reshape(
+        frame_count,
+        frame_size,
+    )
+    trailing_frames = trailing_frames - np.mean(
+        trailing_frames,
+        axis=1,
+        keepdims=True,
+    )
+    trailing_rms = np.sqrt(
+        np.mean(trailing_frames * trailing_frames, axis=1) + 1e-12
+    )
+    trailing_near_silent = (
+        20.0 * np.log10(trailing_rms + 1e-12)
+        <= GENERATED_AUDIO_NEAR_SILENCE_MAXIMUM_DBFS
+    )
+    trailing_count = 0
+    while trailing_count < frame_count and trailing_near_silent[-trailing_count - 1]:
+        trailing_count += 1
+    trailing_samples = trailing_count * frame_size
+    if (
+        trailing_samples < minimum_edge_samples
+        and flattened.size >= minimum_edge_samples
+        and _is_near_silent(flattened[-minimum_edge_samples:])
+    ):
+        trailing_samples = minimum_edge_samples
+    if trailing_samples >= minimum_edge_samples:
+        issues.append(
+            AudioQualityIssue(
+                "excessive trailing near-silence",
+                (flattened.size - trailing_samples) / rate,
                 flattened.size / rate,
             )
         )
-    else:
-        minimum_edge_samples = max(
-            1,
-            math.ceil(GENERATED_AUDIO_EDGE_SILENCE_MINIMUM_SECONDS * rate),
-        )
-        leading_end = 0
-        while leading_end < frame_count and near_silent[leading_end]:
-            leading_end += 1
-        leading_samples = leading_end * frame_size
-        if (
-            leading_samples < minimum_edge_samples
-            and flattened.size >= minimum_edge_samples
-            and _is_near_silent(flattened[:minimum_edge_samples])
-        ):
-            leading_samples = minimum_edge_samples
-        if leading_samples >= minimum_edge_samples:
-            issues.append(
-                AudioQualityIssue(
-                    "excessive leading near-silence",
-                    0.0,
-                    leading_samples / rate,
-                )
-            )
-
-        # Reframe from the end so an otherwise-valid 3-second tail is not
-        # shortened by a partial speech frame at its leading boundary.
-        trailing_frames = flattened[-frame_count * frame_size :].reshape(
-            frame_count,
-            frame_size,
-        )
-        trailing_frames = trailing_frames - np.mean(
-            trailing_frames,
-            axis=1,
-            keepdims=True,
-        )
-        trailing_rms = np.sqrt(np.mean(trailing_frames * trailing_frames, axis=1) + 1e-12)
-        trailing_near_silent = (
-            20.0 * np.log10(trailing_rms + 1e-12)
-            <= GENERATED_AUDIO_NEAR_SILENCE_MAXIMUM_DBFS
-        )
-        trailing_count = 0
-        while trailing_count < frame_count and trailing_near_silent[-trailing_count - 1]:
-            trailing_count += 1
-        trailing_samples = trailing_count * frame_size
-        if (
-            trailing_samples < minimum_edge_samples
-            and flattened.size >= minimum_edge_samples
-            and _is_near_silent(flattened[-minimum_edge_samples:])
-        ):
-            trailing_samples = minimum_edge_samples
-        if trailing_samples >= minimum_edge_samples:
-            issues.append(
-                AudioQualityIssue(
-                    "excessive trailing near-silence",
-                    (flattened.size - trailing_samples) / rate,
-                    flattened.size / rate,
-                )
-            )
 
     low_frequency_power = np.sum(
         power[:, frequencies <= LOW_FREQUENCY_COLLAPSE_MAXIMUM_HZ],
@@ -728,22 +760,14 @@ def find_generated_audio_issues(
         )
 
     if include_vad:
-        for no_speech in default_silero_vad_detector.find_loud_no_speech_ranges(
-            flattened,
-            rate,
-        ):
-            issues.append(
-                AudioQualityIssue(
-                    "audible non-speech synthesis blob",
-                    no_speech.start_seconds,
-                    no_speech.end_seconds,
-                )
-            )
+        _append_vad_issues(issues, flattened, rate)
 
     return sorted(issues, key=lambda issue: (issue.start_seconds, issue.end_seconds))
 
 
 def format_audio_quality_issues(issues: list[AudioQualityIssue]) -> str:
+    """Format detector labels with second-based ranges for logs and errors."""
+
     return "; ".join(
         f"{issue.kind} at {issue.start_seconds:.2f}-{issue.end_seconds:.2f}s"
         for issue in issues
@@ -761,6 +785,8 @@ def wav_generated_audio_issues(
 
 
 def _read_pcm16_mono(path: Path, expected_sample_rate: int) -> np.ndarray:
+    """Read signed PCM16 samples only after validating the complete WAV payload."""
+
     try:
         with wave.open(str(path), "rb") as audio:
             channels = audio.getnchannels()

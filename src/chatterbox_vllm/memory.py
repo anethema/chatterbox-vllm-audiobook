@@ -19,6 +19,8 @@ class MemoryStatus:
 
 
 def read_memory_status(path: str | Path = "/proc/meminfo") -> MemoryStatus:
+    """Read available RAM and unused swap in bytes from Linux meminfo."""
+
     values = {}
     for line in Path(path).read_text(encoding="utf-8").splitlines():
         name, separator, remainder = line.partition(":")

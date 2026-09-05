@@ -22,9 +22,13 @@ class BackgroundTaskPool:
 
     @property
     def pending_count(self) -> int:
+        """Count tasks whose completion has not yet been collected."""
+
         return len(self._pending)
 
     def _resolve(self, completed: set[Future]) -> None:
+        """Collect finished results, propagating worker exceptions to the owner."""
+
         self._pending.difference_update(completed)
         for future in completed:
             self._results.append(future.result())
@@ -50,6 +54,8 @@ class BackgroundTaskPool:
         *args: Any,
         **kwargs: Any,
     ) -> Future:
+        """Apply backpressure before scheduling work; the owning thread must serialize calls."""
+
         if self._closed:
             raise RuntimeError("Background task pool is closed")
         self.check()

@@ -51,4 +51,6 @@ def resolve_model_id(value: str | None) -> str:
 
 
 def model_label(model_id: str) -> str:
+    """Return the display name for a canonical model ID or accepted alias."""
+
     return MODEL_LABELS[resolve_model_id(model_id)]

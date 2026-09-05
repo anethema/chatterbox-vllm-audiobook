@@ -155,6 +155,8 @@ class JobStatusStore:
                 temporary_path.unlink(missing_ok=True)
 
     def snapshot(self) -> JobSnapshot:
+        """Return the immutable current snapshot under the state lock."""
+
         with self._lock:
             return self._snapshot
 
@@ -200,6 +202,8 @@ class JobStatusStore:
             return self._snapshot
 
     def request_stop(self) -> JobSnapshot:
+        """Publish a stopping state without cancelling worker operations directly."""
+
         with self._lock:
             if not self._snapshot.active:
                 return self._snapshot
@@ -211,6 +215,8 @@ class JobStatusStore:
             )
 
     def finish(self, state: str, message: str, **changes: Any) -> JobSnapshot:
+        """Publish a terminal result with any final metrics supplied by the caller."""
+
         if state not in TERMINAL_STATES:
             raise ValueError(f"terminal state required, got {state!r}")
         changes.update(

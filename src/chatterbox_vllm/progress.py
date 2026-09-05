@@ -20,20 +20,28 @@ class GenerationControl:
         self._stop_requested = Event()
 
     def begin(self) -> None:
+        """Start a new job with any previous stop request cleared."""
+
         self._stop_requested.clear()
         self._active.set()
 
     def finish(self) -> None:
+        """Clear active and stop state after job cleanup."""
+
         self._active.clear()
         self._stop_requested.clear()
 
     def request_stop(self) -> bool:
+        """Request cancellation only while a job is active."""
+
         if not self._active.is_set():
             return False
         self._stop_requested.set()
         return True
 
     def stop_requested(self) -> bool:
+        """Read the cooperative stop flag without blocking."""
+
         return self._stop_requested.is_set()
 
 
@@ -57,6 +65,8 @@ def estimate_progress(
 
 
 def format_duration(seconds: float) -> str:
+    """Format nonnegative elapsed seconds as a compact human-readable duration."""
+
     total_seconds = max(0, round(float(seconds)))
     hours, remainder = divmod(total_seconds, 3600)
     minutes, seconds = divmod(remainder, 60)

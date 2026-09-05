@@ -1,3 +1,5 @@
+"""Model loading, reusable voice conditioning, and serialized batched synthesis."""
+
 from dataclasses import dataclass
 import os
 from pathlib import Path
@@ -7,7 +9,7 @@ import time
 
 from vllm import LLM, SamplingParams
 from functools import wraps
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 
 import librosa
 import torch
@@ -73,6 +75,8 @@ class Conditionals:
     gen: dict
 
     def to(self, device):
+        """Move both conditioning formats in place and return this container."""
+
         self.t3 = self.t3.to(device=device)
         for k, v in self.gen.items():
             if torch.is_tensor(v):
@@ -81,11 +85,15 @@ class Conditionals:
 
     @classmethod
     def load(cls, fpath):
+        """Load the tensor-only checkpoint into T3 and decoder conditioning formats."""
+
         kwargs = torch.load(fpath, weights_only=True)
         return cls(T3Cond(**kwargs['t3']), kwargs['gen'])
 
 
 class ChatterboxTTS:
+    """Own the T3 engine, waveform decoder, and bounded voice-conditioning cache."""
+
     ENC_COND_LEN = 6 * S3_SR
     DEC_COND_LEN = 10 * S3GEN_SR
 
@@ -131,6 +139,8 @@ class ChatterboxTTS:
                    # Original Chatterbox defaults this to False. I don't see a substantial performance difference when running with FP16.
                    s3gen_use_fp16: bool = False,
                    **kwargs) -> 'ChatterboxTTS':
+        """Load a matching checkpoint family and initialize its vLLM worker engine."""
+
         ckpt_dir = Path(ckpt_dir)
 
         if model_id is None:
@@ -232,6 +242,8 @@ class ChatterboxTTS:
                         repo_id: str = REPO_ID,
                         revision: str = "1b475dffa71fb191cb6d5901215eb6f55635a9b6",
                         *args, **kwargs) -> 'ChatterboxTTS':
+        """Download the pinned English weights and link them for the vLLM loader."""
+
         for fpath in ["ve.safetensors", "t3_cfg.safetensors", "s3gen.safetensors", "tokenizer.json", "conds.pt"]:
             local_path = hf_hub_download(repo_id=repo_id, filename=fpath, revision=revision)
 
@@ -255,6 +267,8 @@ class ChatterboxTTS:
                                     revision: str | None = None,
                                     model_id: str = MULTILINGUAL_V2_MODEL_ID,
                                     *args, **kwargs) -> 'ChatterboxTTS':
+        """Download a pinned multilingual model and its matching tokenizer."""
+
         model_id = resolve_model_id(model_id)
         if model_id == ENGLISH_V1_MODEL_ID:
             raise ValueError("Use from_pretrained() for the original English model")
@@ -304,6 +318,8 @@ class ChatterboxTTS:
         wav_fpath: Optional[str] = None,
         denoise_reference: bool = False,
     ) -> Tuple[dict[str, Any], torch.Tensor]:
+        """Reuse voice features until the source identity or denoise setting changes."""
+
         identity = None
         if wav_fpath is not None:
             source = Path(wav_fpath).resolve()
@@ -320,6 +336,8 @@ class ChatterboxTTS:
         return result
 
     def _compute_audio_conditionals(self, wav_fpath, denoise_reference):
+        """Derive decoder references and CPU T3 embeddings under the caller lock."""
+
         if wav_fpath is None:
             s3gen_ref_dict = self.default_conds.gen
             t3_cond_prompt_tokens = self.default_conds.t3.cond_prompt_speech_tokens
@@ -360,6 +378,8 @@ class ChatterboxTTS:
 
     @torch.inference_mode()
     def update_exaggeration(self, cond_emb: torch.Tensor, exaggeration: float) -> torch.Tensor:
+        """Replace only the emotion embedding, preserving cached neutral conditionals."""
+
         if exaggeration == 0.5:
             return cond_emb
 
@@ -387,7 +407,9 @@ class ChatterboxTTS:
 
         # Supports anything in https://docs.vllm.ai/en/v0.9.2/api/vllm/index.html?h=samplingparams#vllm.SamplingParams
         *args, **kwargs,
-    ) -> list[any]:
+    ) -> list[torch.Tensor]:
+        """Prepare voice features, then synthesize one waveform per requested output."""
+
         s3gen_ref, cond_emb = self.get_audio_conditionals(
             audio_prompt_path,
             denoise_reference=denoise_reference,
@@ -431,13 +453,15 @@ class ChatterboxTTS:
 
         # Supports anything in https://docs.vllm.ai/en/v0.9.2/api/vllm/index.html?h=samplingparams#vllm.SamplingParams
         *args, **kwargs,
-    ) -> list[any]:
+    ) -> list[torch.Tensor]:
+        """Generate speech from cached voice features; return empty audio for bad tokens."""
+
         if isinstance(prompts, str):
             prompts = [prompts]
 
-        # Validate language_id
-        if language_id and language_id.lower() not in self.get_supported_languages():
-            supported_langs = ", ".join(self.get_supported_languages().keys())
+        supported_languages = self.get_supported_languages()
+        if language_id and language_id.lower() not in supported_languages:
+            supported_langs = ", ".join(supported_languages)
             raise ValueError(
                 f"Unsupported language_id '{language_id}'. "
                 f"Supported languages: {supported_langs}"
@@ -455,15 +479,14 @@ class ChatterboxTTS:
         # Clean only the transient inference prompts.  EPUB chunks and project
         # metadata retain their original source text for resumes and auditing.
         cleaned_prompts = []
-        cleanup_counts = {}
+        cleanup_counts = Counter()
         changed_prompt_count = 0
         for prompt in prompts:
             cleaned_prompt, changes = prepare_tts_text(prompt)
             cleaned_prompts.append(cleaned_prompt)
             if changes:
                 changed_prompt_count += 1
-                for category, count in changes.items():
-                    cleanup_counts[category] = cleanup_counts.get(category, 0) + count
+                cleanup_counts.update(changes)
         if changed_prompt_count:
             details = ", ".join(
                 f"{category}={count}"
@@ -485,7 +508,7 @@ class ChatterboxTTS:
             prompts = [f"<{language_id.lower()}>{p}" for p in prompts]
 
         with torch.inference_mode():
-            start_time = time.time()
+            start_time = time.perf_counter()
             # vLLM's V1 engine passes None as custom-model sampling metadata,
             # so update the worker model directly. Keep the update and T3 run
             # atomic because the scale is shared by the worker.
@@ -512,14 +535,14 @@ class ChatterboxTTS:
                         *args, **kwargs,
                     )
                 )
-            t3_gen_time = time.time() - start_time
+            t3_gen_time = time.perf_counter() - start_time
             print(f"[T3] Speech Token Generation time: {t3_gen_time:.2f}s")
 
             # run torch gc
             if self.flush_cuda_cache:
                 torch.cuda.empty_cache()
 
-            start_time = time.time()
+            start_time = time.perf_counter()
             results = []
             for i, batch_result in enumerate(batch_results):
                 for output in batch_result.outputs:
@@ -558,12 +581,14 @@ class ChatterboxTTS:
                         clean_tokens = max(1, token_count - 1)
                         wav = wav[..., :clean_tokens * (S3GEN_SR // S3_TOKEN_RATE)]
                     results.append(wav.cpu())
-            s3gen_gen_time = time.time() - start_time
-            print(f"[S3Gen] Wavform Generation time: {s3gen_gen_time:.2f}s")
+            s3gen_gen_time = time.perf_counter() - start_time
+            print(f"[S3Gen] Waveform Generation time: {s3gen_gen_time:.2f}s")
 
             return results
         
     def shutdown(self):
+        """Stop engine workers and release model-owned tensors and reference caches."""
+
         with self._inference_lock:
             if self._closed:
                 return

@@ -311,7 +311,7 @@ Run the unit suite without loading the model:
 .venv/bin/ruff check gradio_tts_app.py src tests
 ~~~
 
-Run the opt-in GPU smoke test to exercise model loading, RNNoise conditioning, EPUB generation, quality scanning, stop/resume, M4B assembly, and final verification. It creates and removes its own small test projects:
+Run the opt-in GPU smoke test to exercise model loading, RNNoise conditioning, EPUB generation, quality scanning, stop/resume, M4B assembly, and final verification. It creates and removes its own small test projects in an isolated temporary directory, including a separate job-status checkpoint and Gradio cache:
 
 ~~~bash
 .venv/bin/python tests/epub_gpu_smoke.py
